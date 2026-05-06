@@ -1,0 +1,8 @@
+# Ignore dataset folders
+datasets/
+
+# Ignore preprocessed datasets
+preprocessed-datasets/
+
+# Ignore Python environment
+venv/
