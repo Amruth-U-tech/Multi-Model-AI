@@ -24,6 +24,7 @@
 # !pip install pandas numpy tqdm --quiet
 
 import os
+import json
 import warnings
 from typing import Optional
 
@@ -240,28 +241,110 @@ def process_dataset(input_path: str, output_dir: str) -> bool:
         return False
 
     # =========================================================================
-    # CELL 5 (original) — Load Raw JSON-Lines File
+    # CELL 5 (original) — Load Raw JSON-Lines File  [STREAMING VERSION]
+    # Replaced pd.read_json() with a line-by-line streaming loader to prevent
+    # MemoryError on large files (millions of rows). Logic after df_raw is
+    # created remains 100% unchanged.
     # =========================================================================
 
-    print(f"\n📂 Loading raw data from: {input_path}")
-    print("   (This may take a moment for large files...)\n")
+    print(f"\n📂 Streaming data from: {input_path}")
+    print("   (Memory-safe chunk loading — safe for any file size...)\n")
 
-    # ── Safe load with pd.read_json lines=True ────────────────────────────────
-    # EDGE CASE 2 — JSON parse failure: skip and log
+    # ── Streaming constants ───────────────────────────────────────────────────
+    MAX_BUFFER_ROWS = 2000          # Rows to accumulate before flushing to DataFrame
+    TARGET_ROWS     = MAX_ROWS      # Final desired rows (reuses global MAX_ROWS)
+    BUFFER_FACTOR   = 2             # Safety multiplier: collect 2× target before stopping
+    REQUIRED_ROWS   = TARGET_ROWS * BUFFER_FACTOR   # = 3200 rows (enough for cleaning loss)
+
+    # ── Streaming state ───────────────────────────────────────────────────────
+    buffer           = []       # Raw line accumulator (cleared each chunk)
+    collected_chunks = []       # List of lightweight DataFrames per chunk
+    total_collected  = 0        # Running count of usable rows collected so far
+
+    # ── Stream file line by line — O(chunk) memory, not O(file) ──────────────
     try:
-        df_raw = pd.read_json(input_path, lines=True)
-    except FileNotFoundError:
-        print(f"❌ [SKIP] File disappeared between check and read:")
+        with open(input_path, "r", encoding="utf-8") as f:
+            for line in f:
+                # ── Parse single JSON line — skip malformed lines silently ───
+                try:
+                    record = json.loads(line)
+                    buffer.append(record)
+                except (json.JSONDecodeError, ValueError):
+                    continue    # EDGE CASE: bad JSON line → skip, do not crash
+
+                # ── Flush buffer to DataFrame when chunk size reached ─────────
+                if len(buffer) >= MAX_BUFFER_ROWS:
+                    df_chunk = pd.DataFrame(buffer)
+
+                    # Keep only required columns early → reduces RAM per chunk
+                    existing_cols = [c for c in SOURCE_COLUMNS if c in df_chunk.columns]
+                    df_chunk = df_chunk[existing_cols]
+
+                    # Early lightweight filter → drop obviously unusable rows now
+                    # (saves memory; full cleaning still happens downstream)
+                    # Guard subset to only columns present in this chunk
+                    early_filter_cols = [c for c in ["title", "images", "average_rating"]
+                                         if c in df_chunk.columns]
+                    if early_filter_cols:
+                        df_chunk = df_chunk.dropna(subset=early_filter_cols)
+
+                    collected_chunks.append(df_chunk)
+                    total_collected += len(df_chunk)
+                    buffer = []     # Reset buffer for next chunk
+
+                    # ── Early exit once enough rows collected ─────────────────
+                    # Prevents reading the entire file for large datasets
+                    if total_collected >= REQUIRED_ROWS:
+                        print(f"   ⚡ Early exit: {total_collected} rows collected "
+                              f"(target={REQUIRED_ROWS}). Stopping stream.")
+                        break
+
+        # ── Flush remaining buffer (CRITICAL for small datasets) ──────────────
+        # Without this, datasets smaller than MAX_BUFFER_ROWS produce empty result
+        if buffer:
+            df_chunk = pd.DataFrame(buffer)
+
+            existing_cols = [c for c in SOURCE_COLUMNS if c in df_chunk.columns]
+            df_chunk = df_chunk[existing_cols]
+
+            # Guard subset to only columns present in this chunk
+            early_filter_cols = [c for c in ["title", "images", "average_rating"]
+                                  if c in df_chunk.columns]
+            if early_filter_cols:
+                df_chunk = df_chunk.dropna(subset=early_filter_cols)
+
+            collected_chunks.append(df_chunk)
+            total_collected += len(df_chunk)
+
+    except OSError as e:
+        # EDGE CASE 2 — File disappeared between existence check and open
+        print(f"❌ [SKIP] Could not open file:")
         print(f"   → {input_path}")
-        return False
-    except ValueError as e:
-        print(f"❌ [SKIP] Failed to parse JSON file. Ensure it is valid JSON-lines format.")
         print(f"   Error: {e}")
         return False
 
-    print(f"✅ Raw data loaded successfully.")
-    print(f"   Shape          : {df_raw.shape}")
-    print(f"   Columns present: {list(df_raw.columns)}")
+    # ── EDGE CASE: No valid data collected at all ─────────────────────────────
+    if not collected_chunks:
+        print(f"⚠️  [SKIP] No valid data collected during streaming — skipping dataset.")
+        return False
+
+    # ── Combine all chunks into a single DataFrame ────────────────────────────
+    df_raw = pd.concat(collected_chunks, ignore_index=True)
+
+    # ── EDGE CASE: Small dataset (fewer rows than TARGET_ROWS) ───────────────
+    if len(df_raw) < TARGET_ROWS:
+        print(f"⚠️  Small dataset detected ({len(df_raw)} rows < target {TARGET_ROWS}). "
+              f"Using all available data.")
+
+    # ── Cap upper bound to REQUIRED_ROWS to avoid excess memory downstream ────
+    if len(df_raw) > REQUIRED_ROWS:
+        df_raw = df_raw.sample(n=REQUIRED_ROWS, random_state=RANDOM_SEED)
+        df_raw.reset_index(drop=True, inplace=True)
+
+    print(f"\n✅ Streaming load complete.")
+    print(f"   Chunks collected   : {len(collected_chunks)}")
+    print(f"📦 Streaming loaded rows: {len(df_raw)}")
+    print(f"   Columns present    : {list(df_raw.columns)}")
 
     rows_before_cleaning = len(df_raw)      # ← logged at end
 
