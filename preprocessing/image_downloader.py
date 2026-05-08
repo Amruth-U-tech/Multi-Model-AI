@@ -18,12 +18,12 @@ from io import BytesIO
 # List of preprocessed CSV dataset paths. 
 # Modify these paths depending on your environment (Local vs Google Colab).
 CSV_FILES = [
-    "d:/multi-model-ai/preprocessed-datasets/meta_amazon_fashion_processed.csv",
-    "d:/multi-model-ai/preprocessed-datasets/meta_digital_music_processed.csv"
+    "D:/multi-model-ai/preprocessed-datasets/sample_100.csv",
+    "D:/multi-model-ai/preprocessed-datasets/sample_100_2.csv"
 ]
 
 # Output directory for downloaded images
-IMAGE_OUTPUT_DIR = "d:/multi-model-ai/images"
+IMAGE_OUTPUT_DIR = "D:/multi-model-ai/preprocessed-datasets/images"
 
 MAX_CONCURRENT_DOWNLOADS = 20
 REQUEST_TIMEOUT = 15
