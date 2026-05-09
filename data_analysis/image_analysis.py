@@ -455,15 +455,27 @@ def print_insight_summary(
     print(f"       Images exceeding 512px in any dimension : {oversized}")
     print(f"       Result → {'✅ RESIZE APPLIED CORRECTLY' if oversized == 0 else f'⚠️  {oversized} images NOT resized — check pipeline'}")
 
-    # ── Q3: Visual richness ───────────────────────────────────────────────────
-    # std_intensity > 40 indicates rich textured images
-    rich_threshold = 40.0
-    rich_count  = (si > rich_threshold).sum()
-    rich_pct    = rich_count / len(stats_df) * 100
-    print(f"\n  Q3 — Visual Richness (std_intensity > {rich_threshold}):")
-    print(f"       Rich images : {rich_count} / {len(stats_df)} ({rich_pct:.1f}%)")
-    print(f"       Avg std     : {si.mean():.2f}")
-    print(f"       Result → {'✅ VISUALLY RICH' if rich_pct > 60 else '⚠️  MOSTLY PLAIN — low texture content'}")
+    # ── Q3: Visual richness (percentile-based — dataset-relative) ───────────
+    # Threshold = 75th percentile of pixel std_intensity for THIS dataset.
+    # Top 25% = visually rich (high texture). Bottom 25% = visually plain.
+    rich_threshold   = si.quantile(0.75)   # dataset-relative richness bar
+    plain_threshold  = si.quantile(0.25)   # bottom quartile = plain/flat
+    rich_count       = (si > rich_threshold).sum()
+    plain_count      = (si < plain_threshold).sum()
+    rich_pct         = rich_count / len(stats_df) * 100
+    plain_pct        = plain_count / len(stats_df) * 100
+    si_iqr           = rich_threshold - plain_threshold   # spread of middle 50%
+    print(f"\n  Q3 — Visual Richness (dataset-relative, percentile-based):")
+    print(f"       Rich threshold  (p75): {rich_threshold:.2f}  →  {rich_count} images above ({rich_pct:.1f}%)")
+    print(f"       Plain threshold (p25): {plain_threshold:.2f}  →  {plain_count} images below ({plain_pct:.1f}%)")
+    print(f"       Dataset std_intensity → mean={si.mean():.2f}  median={si.median():.2f}  IQR={si_iqr:.2f}")
+    if si_iqr > 20:
+        richness_verdict = "✅ VISUALLY DIVERSE — strong texture variation across dataset"
+    elif si.median() > si.quantile(0.50) * 0.8:
+        richness_verdict = "🔶 MODERATE RICHNESS — some texture variation present"
+    else:
+        richness_verdict = "⚠️  MOSTLY PLAIN — low intra-dataset texture variation"
+    print(f"       Result → {richness_verdict}")
 
     # ── Q4: File size variation ───────────────────────────────────────────────
     fs_cv = fs.std() / fs.mean() * 100 if fs.mean() > 0 else 999
@@ -471,21 +483,47 @@ def print_insight_summary(
     print(f"       Mean={fs.mean():.1f}KB  Min={fs.min():.1f}KB  Max={fs.max():.1f}KB  CV={fs_cv:.1f}%")
     print(f"       Result → {'⚠️  HIGH SIZE VARIATION' if fs_cv > 80 else '✅ SIZE VARIATION MODERATE'}")
 
-    # ── Q5: Quality (file size proxy) ─────────────────────────────────────────
-    low_quality_threshold_kb = 5.0
-    low_quality_count = (fs < low_quality_threshold_kb).sum()
-    low_quality_pct   = low_quality_count / len(stats_df) * 100
-    print(f"\n  Q5 — Image Quality (file size < {low_quality_threshold_kb}KB = suspect):")
-    print(f"       Low-quality suspects : {low_quality_count} ({low_quality_pct:.1f}%)")
-    print(f"       Result → {'✅ MOSTLY HIGH QUALITY' if low_quality_pct < 10 else '⚠️  QUALITY CONCERNS DETECTED'}")
+    # ── Q5: Quality (percentile-based — dataset-relative) ───────────────────
+    # Threshold = 10th percentile of file_size_kb for THIS dataset.
+    # Images below p10 are unusually compressed relative to their peers.
+    low_quality_threshold_kb = fs.quantile(0.10)   # dataset-relative floor
+    low_quality_count        = (fs < low_quality_threshold_kb).sum()
+    low_quality_pct          = low_quality_count / len(stats_df) * 100
+    fs_median                = fs.median()
+    fs_p90                   = fs.quantile(0.90)
+    print(f"\n  Q5 — Image Quality (dataset-relative, percentile-based):")
+    print(f"       Quality floor (p10) : {low_quality_threshold_kb:.2f} KB")
+    print(f"       Images below floor  : {low_quality_count} ({low_quality_pct:.1f}%)  ← unusually compressed")
+    print(f"       File size → median={fs_median:.1f}KB  p90={fs_p90:.1f}KB  max={fs.max():.1f}KB")
+    if low_quality_pct < 5:
+        quality_verdict = "✅ QUALITY CONSISTENT — minimal low-detail outliers"
+    elif low_quality_pct < 15:
+        quality_verdict = "🔶 MODERATE QUALITY SPREAD — review bottom-10% images"
+    else:
+        quality_verdict = "⚠️  QUALITY CONCERNS — large fraction of unusually small files"
+    print(f"       Result → {quality_verdict}")
 
-    # ── Q6: CNN learnable signal ──────────────────────────────────────────────
-    # Good signal = high std_intensity AND not purely uniform
-    avg_std = si.mean()
-    cnn_ready = avg_std > 35
-    print(f"\n  Q6 — CNN Learnable Visual Signal:")
-    print(f"       Mean pixel std across dataset : {avg_std:.2f}")
-    print(f"       Result → {'✅ STRONG VISUAL SIGNAL — CNN will find patterns' if cnn_ready else '⚠️  WEAK SIGNAL — images may be too uniform'}")
+    # ── Q6: CNN learnable signal (dataset-relative, variance-spread based) ──
+    # Uses IQR of std_intensity as the primary diversity proxy:
+    #   - Large IQR  → images span a wide texture range → CNN sees varied inputs
+    #   - Small IQR  → images are uniformly similar     → CNN may underfit
+    # Also uses p90–p10 spread for tail separation strength.
+    si_p10      = si.quantile(0.10)
+    si_p90      = si.quantile(0.90)
+    si_iqr_cnn  = si.quantile(0.75) - si.quantile(0.25)   # interquartile range
+    si_spread   = si_p90 - si_p10                          # tail-to-tail spread
+    si_mean     = si.mean()
+    si_cv       = (si.std() / si_mean * 100) if si_mean > 0 else 0  # coeff of variation
+    print(f"\n  Q6 — CNN Learnable Visual Signal (dataset-relative):")
+    print(f"       std_intensity → mean={si_mean:.2f}  IQR={si_iqr_cnn:.2f}  p10–p90 spread={si_spread:.2f}")
+    print(f"       Coefficient of variation (CV) : {si_cv:.1f}%")
+    if si_iqr_cnn > 25 and si_spread > 40:
+        cnn_verdict = "✅ STRONG SIGNAL — high intra-dataset diversity, CNN will learn rich patterns"
+    elif si_iqr_cnn > 12 or si_spread > 20:
+        cnn_verdict = "🔶 MODERATE SIGNAL — reasonable visual variation, CNN should learn basic patterns"
+    else:
+        cnn_verdict = "⚠️  WEAK SIGNAL — low visual diversity, CNN may struggle to distinguish classes"
+    print(f"       Result → {cnn_verdict}")
 
     # ── Q7: Corrupted / problematic images ───────────────────────────────────
     corrupt_pct = len(failed_list) / total_attempted * 100 if total_attempted > 0 else 0

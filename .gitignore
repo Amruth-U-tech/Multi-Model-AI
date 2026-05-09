@@ -6,3 +6,6 @@ preprocessed-datasets/
 
 # Ignore Python environment
 venv/
+
+#ignore screenshot folder
+screenshots/
