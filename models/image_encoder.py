@@ -626,7 +626,7 @@ if __name__ == "__main__":
     logger.info(f"Device: {device}")
 
     # ── Config construction ───────────────────────────────────────────────────
-    config  = ImageEncoderConfig(latent_dim=256, freeze_backbone=True)
+    config  = ImageEncoderConfig(latent_dim=512, freeze_backbone=True)
     encoder = build_encoder(config)
     encoder.to(device)
     encoder.eval()
@@ -648,7 +648,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         emb = encoder(dummy)
 
-    assert emb.shape == (4, 256), f"Shape mismatch: {emb.shape}"
+    assert emb.shape == (4, config.latent_dim), f"Shape mismatch: {emb.shape}"
 
     # ── L2 norm verification ──────────────────────────────────────────────────
     norms = emb.norm(dim=1)
@@ -660,3 +660,10 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("  ✅  Smoke test PASSED — ImageEncoder is integration-ready.")
     logger.info("=" * 60)
+
+
+
+
+
+
+
