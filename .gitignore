@@ -9,3 +9,5 @@ venv/
 
 #ignore screenshot folder
 screenshots/
+
+issues_file_dependencies.txt
