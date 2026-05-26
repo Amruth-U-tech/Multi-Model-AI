@@ -380,7 +380,7 @@ class ImageEncoder(nn.Module):
              ↓
         Deep feature vector  (B, 768)
              ↓
-        ProjectionHead: Linear(768→512) → GELU → Dropout → Linear(512→256)
+        ProjectionHead: Linear(768→512) → GELU → Dropout → Linear(512→512)
              ↓
         Latent Embedding  (B, latent_dim)
              ↓
