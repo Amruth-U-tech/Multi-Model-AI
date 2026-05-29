@@ -11,3 +11,6 @@ venv/
 screenshots/
 
 issues_file_dependencies.txt
+
+#ignore model files
+__pycache__/

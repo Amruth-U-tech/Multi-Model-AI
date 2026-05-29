@@ -29,9 +29,18 @@
 # =============================================================================
 
 import os
+import sys
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
+
+# ─────────────────────────────────────────────────────────────
+# Google Colab + Project Import Safety
+# ─────────────────────────────────────────────────────────────
+PROJECT_PATH = Path("/content/drive/MyDrive/multi-model-ai")
+if str(PROJECT_PATH) not in sys.path:
+    sys.path.append(str(PROJECT_PATH))
 
 import torch
 import torch.nn as nn
@@ -64,6 +73,9 @@ IMAGENET_MEAN: Tuple[float, float, float] = (0.485, 0.456, 0.406)
 IMAGENET_STD : Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
 # ── ConvNeXt Tiny feature dimension (timm, num_classes=0) ────────────────────
+# Default reference for documentation and smoke-test fallback.
+# At runtime, ImageEncoder.__init__ queries backbone.num_features dynamically
+# to support backbone swaps (ViT, SwinTransformer, etc.) without code changes.
 CONVNEXT_FEATURE_DIM: int = 768
 
 # ── Preprocessing geometry ────────────────────────────────────────────────────
@@ -423,7 +435,23 @@ class ImageEncoder(nn.Module):
             pretrained  = config.pretrained,
             num_classes = 0,
         )
-        logger.info(f"Backbone loaded | feature_dim={CONVNEXT_FEATURE_DIM}")
+
+        # ── Dynamic feature dimension detection ──────────────────────────────
+        # Queries the actual backbone output dim instead of assuming 768.
+        # This makes backbone swaps (ViT, Swin, EfficientNet) work without
+        # code changes — only config.backbone_name needs to change.
+        if not hasattr(self.backbone, 'num_features'):
+            raise RuntimeError(
+                f"Backbone '{config.backbone_name}' does not expose 'num_features'. "
+                f"Cannot determine projection head input dimension. "
+                f"Verify the timm model supports num_classes=0 feature extraction."
+            )
+        backbone_feature_dim = self.backbone.num_features
+        self.backbone_feature_dim = backbone_feature_dim
+        logger.info(
+            f"Backbone loaded | model={config.backbone_name} | "
+            f"feature_dim={backbone_feature_dim}"
+        )
 
         # ── Selective backbone freezing ───────────────────────────────────────
         if config.freeze_backbone:
@@ -431,7 +459,7 @@ class ImageEncoder(nn.Module):
 
         # ── Projection head ───────────────────────────────────────────────────
         self.projection = ProjectionHead(
-            in_dim     = CONVNEXT_FEATURE_DIM,
+            in_dim     = backbone_feature_dim,
             hidden_dim = config.hidden_dim,
             latent_dim = config.latent_dim,
             dropout    = config.dropout,
@@ -622,47 +650,49 @@ if __name__ == "__main__":
     logger.info("  image_encoder.py — smoke test")
     logger.info("=" * 60)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Device: {device}")
 
-    # ── Config construction ───────────────────────────────────────────────────
-    config  = ImageEncoderConfig(latent_dim=512, freeze_backbone=True)
-    encoder = build_encoder(config)
-    encoder.to(device)
-    encoder.eval()
+        # ── Config construction ───────────────────────────────────────────────────
+        config  = ImageEncoderConfig(latent_dim=512, freeze_backbone=True)
+        encoder = build_encoder(config)
+        encoder.to(device)
+        encoder.eval()
 
-    # ── safe_load_image edge cases ────────────────────────────────────────────
-    logger.info("Testing safe_load_image() edge cases...")
-    assert safe_load_image(None).size  == INPUT_SIZE   # Edge Case 1 — None
-    assert safe_load_image("").size    == INPUT_SIZE   # Edge Case 1 — empty
-    assert safe_load_image("/nonexistent/B001J63LJQ.jpg").size == INPUT_SIZE  # Edge Case 2
-    logger.info("safe_load_image(): PASSED")
+        # ── safe_load_image edge cases ────────────────────────────────────────────
+        logger.info("Testing safe_load_image() edge cases...")
+        assert safe_load_image(None).size  == INPUT_SIZE   # Edge Case 1 — None
+        assert safe_load_image("").size    == INPUT_SIZE   # Edge Case 1 — empty
+        assert safe_load_image("/nonexistent/B001J63LJQ.jpg").size == INPUT_SIZE  # Edge Case 2
+        logger.info("safe_load_image(): PASSED")
 
-    # ── Transform pipelines ───────────────────────────────────────────────────
-    _ = get_transforms(config, "train")
-    _ = get_transforms(config, "eval")
-    logger.info("get_transforms(): PASSED")
+        # ── Transform pipelines ───────────────────────────────────────────────────
+        _ = get_transforms(config, "train")
+        _ = get_transforms(config, "eval")
+        logger.info("get_transforms(): PASSED")
 
-    # ── Forward pass ──────────────────────────────────────────────────────────
-    dummy = torch.randn(4, 3, 224, 224).to(device)
-    with torch.no_grad():
-        emb = encoder(dummy)
+        # ── Forward pass ──────────────────────────────────────────────────────────
+        dummy = torch.randn(4, 3, 224, 224).to(device)
+        with torch.no_grad():
+            emb = encoder(dummy)
 
-    assert emb.shape == (4, config.latent_dim), f"Shape mismatch: {emb.shape}"
+        assert emb.shape == (4, config.latent_dim), f"Shape mismatch: {emb.shape}"
 
-    # ── L2 norm verification ──────────────────────────────────────────────────
-    norms = emb.norm(dim=1)
-    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), "L2 norm failed"
+        # ── L2 norm verification ──────────────────────────────────────────────────
+        norms = emb.norm(dim=1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), "L2 norm failed"
 
-    logger.info(f"Output shape  : {tuple(emb.shape)}")
-    logger.info(f"Norms (≈ 1.0) : {norms.tolist()}")
-    logger.info(f"Trainable params: {encoder._count_trainable_params():,}")
-    logger.info("=" * 60)
-    logger.info("  ✅  Smoke test PASSED — ImageEncoder is integration-ready.")
-    logger.info("=" * 60)
+        logger.info(f"Output shape  : {tuple(emb.shape)}")
+        logger.info(f"Norms (≈ 1.0) : {norms.tolist()}")
+        logger.info(f"Trainable params: {encoder._count_trainable_params():,}")
+        logger.info("=" * 60)
+        logger.info("  ✅  Smoke test PASSED — ImageEncoder is integration-ready.")
+        logger.info("=" * 60)
 
-
-
+    except Exception as e:
+        logger.exception(f"❌ SMOKE TEST FAILED: {e}")
+        sys.exit(1)
 
 
 

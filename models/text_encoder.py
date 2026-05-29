@@ -59,9 +59,18 @@
 #   - Future fine-tuning via config.freeze_backbone = False
 # =============================================================================
 
+import sys
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Union
+
+# ─────────────────────────────────────────────────────────────
+# Google Colab + Project Import Safety
+# ─────────────────────────────────────────────────────────────
+PROJECT_PATH = Path("/content/drive/MyDrive/multi-model-ai")
+if str(PROJECT_PATH) not in sys.path:
+    sys.path.append(str(PROJECT_PATH))
 
 import torch
 import torch.nn as nn
@@ -767,61 +776,66 @@ if __name__ == "__main__":
     logger.info("  text_encoder.py — smoke test")
     logger.info("=" * 60)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Device: {device}")
 
-    # ── Config and encoder ────────────────────────────────────────────────────
-    config  = TextEncoderConfig(latent_dim=512, freeze_backbone=True)
-    encoder = build_text_encoder(config)
-    encoder.to(device)
-    encoder.eval()
+        # ── Config and encoder ────────────────────────────────────────────────────
+        config  = TextEncoderConfig(latent_dim=512, freeze_backbone=True)
+        encoder = build_text_encoder(config)
+        encoder.to(device)
+        encoder.eval()
 
-    # ── sanitize_text edge cases ──────────────────────────────────────────────
-    logger.info("Testing sanitize_text() edge cases...")
-    assert sanitize_text(None)          == FALLBACK_TEXT
-    assert sanitize_text("")            == FALLBACK_TEXT
-    assert sanitize_text("   ")        == FALLBACK_TEXT
-    assert sanitize_text(float("nan")) == FALLBACK_TEXT
-    assert sanitize_text(42)           == "42"
-    assert sanitize_text(3.14)         == "3.14"
-    logger.info("sanitize_text(): PASSED  ✅")
+        # ── sanitize_text edge cases ──────────────────────────────────────────────
+        logger.info("Testing sanitize_text() edge cases...")
+        assert sanitize_text(None)          == FALLBACK_TEXT
+        assert sanitize_text("")            == FALLBACK_TEXT
+        assert sanitize_text("   ")        == FALLBACK_TEXT
+        assert sanitize_text(float("nan")) == FALLBACK_TEXT
+        assert sanitize_text(42)           == "42"
+        assert sanitize_text(3.14)         == "3.14"
+        logger.info("sanitize_text(): PASSED  ✅")
 
-    # ── Realistic Amazon Fashion product titles ───────────────────────────────
-    raw_texts = [
-        "Spanx Core In-Power Line Super High Shaping Sheers Very Black F",
-        "KingSize Men's Big & Tall Lightweight Jersey Cargo Sweatpants",
-        "Boho Tassel Earrings for Women Girls Multicolor Bohemian Fan Statement",
-        "",    # Edge Case — becomes FALLBACK_TEXT
-    ]
-    clean = [sanitize_text(t) for t in raw_texts]
+        # ── Realistic Amazon Fashion product titles ───────────────────────────────
+        raw_texts = [
+            "Spanx Core In-Power Line Super High Shaping Sheers Very Black F",
+            "KingSize Men's Big & Tall Lightweight Jersey Cargo Sweatpants",
+            "Boho Tassel Earrings for Women Girls Multicolor Bohemian Fan Statement",
+            "",    # Edge Case — becomes FALLBACK_TEXT
+        ]
+        clean = [sanitize_text(t) for t in raw_texts]
 
-    # ── encode_texts convenience method ───────────────────────────────────────
-    logger.info("Testing encode_texts() with Amazon product titles...")
-    emb = encoder.encode_texts(clean, device=device)
-    assert emb.shape == (4, config.latent_dim), f"Shape mismatch: {emb.shape}"
-    logger.info(f"encode_texts() shape : {tuple(emb.shape)}  ✅")
+        # ── encode_texts convenience method ───────────────────────────────────────
+        logger.info("Testing encode_texts() with Amazon product titles...")
+        emb = encoder.encode_texts(clean, device=device)
+        assert emb.shape == (4, config.latent_dim), f"Shape mismatch: {emb.shape}"
+        logger.info(f"encode_texts() shape : {tuple(emb.shape)}  ✅")
 
-    # ── L2 normalization ──────────────────────────────────────────────────────
-    norms = emb.norm(dim=1)
-    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
-    logger.info(f"Norms (≈ 1.0)        : {[round(n,4) for n in norms.tolist()]}  ✅")
+        # ── L2 normalization ──────────────────────────────────────────────────────
+        norms = emb.norm(dim=1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+        logger.info(f"Norms (≈ 1.0)        : {[round(n,4) for n in norms.tolist()]}  ✅")
 
-    # ── DataLoader-style forward pass (primary training path) ─────────────────
-    logger.info("Testing DataLoader-style forward pass...")
-    encoded = tokenize_batch(
-        texts      = clean,
-        tokenizer  = encoder.tokenizer,
-        max_length = config.max_length,
-        device     = device,
-    )
-    with torch.no_grad():
-        emb2 = encoder(encoded["input_ids"], encoded["attention_mask"])
-    assert emb2.shape == (4, config.latent_dim), f"Forward shape mismatch: {emb2.shape}"
-    logger.info(f"forward() shape      : {tuple(emb2.shape)}  ✅")
+        # ── DataLoader-style forward pass (primary training path) ─────────────────
+        logger.info("Testing DataLoader-style forward pass...")
+        encoded = tokenize_batch(
+            texts      = clean,
+            tokenizer  = encoder.tokenizer,
+            max_length = config.max_length,
+            device     = device,
+        )
+        with torch.no_grad():
+            emb2 = encoder(encoded["input_ids"], encoded["attention_mask"])
+        assert emb2.shape == (4, config.latent_dim), f"Forward shape mismatch: {emb2.shape}"
+        logger.info(f"forward() shape      : {tuple(emb2.shape)}  ✅")
 
-    # ── Trainable parameter count ─────────────────────────────────────────────
-    logger.info(f"Trainable params     : {encoder._count_trainable_params():,}")
+        # ── Trainable parameter count ─────────────────────────────────────────────
+        logger.info(f"Trainable params     : {encoder._count_trainable_params():,}")
 
-    logger.info("=" * 60)
-    logger.info("  ✅  Smoke test PASSED — TextEncoder is integration-ready.")
-    logger.info("=" * 60)
+        logger.info("=" * 60)
+        logger.info("  ✅  Smoke test PASSED — TextEncoder is integration-ready.")
+        logger.info("=" * 60)
+
+    except Exception as e:
+        logger.exception(f"❌ SMOKE TEST FAILED: {e}")
+        sys.exit(1)

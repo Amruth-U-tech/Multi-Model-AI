@@ -9,14 +9,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Dict, Tuple
 
 # ─────────────────────────────────────────────────────────────
 # Google Colab + Project Import Safety
 # ─────────────────────────────────────────────────────────────
-PROJECT_PATH = "/content/drive/MyDrive/multi-model-ai"
-if PROJECT_PATH not in sys.path:
-    sys.path.append(PROJECT_PATH)
+PROJECT_PATH = Path("/content/drive/MyDrive/multi-model-ai")
+if str(PROJECT_PATH) not in sys.path:
+    sys.path.append(str(PROJECT_PATH))
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +26,38 @@ class FusionConfig:
     """
     Configuration for the Multimodal System Brain.
     Ensures symmetry across the 512-dimensional latent manifold.
+
+    Per-modality dimensions allow independent contract validation.
+    When all dims are 512 (default), behavior is identical to the
+    original single-dim design — but drift is now caught immediately.
     """
-    embedding_dim: int = 512
+    # ── Per-Modality Latent Contracts ──────────────────────────────────────
+    image_dim  : int = 512   # Must match ImageEncoder.get_embedding_dim()
+    text_dim   : int = 512   # Must match TextEncoder.get_embedding_dim()
+    tabular_dim: int = 512   # Must match TabularEncoder.get_embedding_dim()
+    fusion_dim : int = 512   # Output dim of fused embedding (prediction head input)
+
+    # ── Fusion Architecture ───────────────────────────────────────────────
     hidden_dim: int = 1024
     dropout: float = 0.2
     modality_dropout_prob: float = 0.1
     normalize_embeddings: bool = True
+
+    @property
+    def embedding_dim(self) -> int:
+        """Backward-compatible: returns image_dim (assumed uniform when equal)."""
+        if not (self.image_dim == self.text_dim == self.tabular_dim):
+            raise ValueError(
+                f"embedding_dim property requires uniform dims, but got "
+                f"image={self.image_dim}, text={self.text_dim}, tabular={self.tabular_dim}. "
+                f"Use per-modality dims directly instead."
+            )
+        return self.image_dim
+
+    @property
+    def total_input_dim(self) -> int:
+        """Sum of all modality dims — used as gate input size."""
+        return self.image_dim + self.text_dim + self.tabular_dim
 
 class FusionModel(nn.Module):
     """
@@ -43,18 +70,19 @@ class FusionModel(nn.Module):
         
         # 1. Modality Gating (Stable Adaptive Trust)
         self.modality_gate = nn.Sequential(
-            nn.Linear(self.config.embedding_dim * 3, self.config.hidden_dim),
+            nn.Linear(self.config.total_input_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Linear(self.config.hidden_dim, 3),
             nn.Softmax(dim=1)
         )
         
         # 2. Fusion Projection MLP (Interaction Space)
+        # After weighted sum (all modality dims must be equal), project to fusion_dim.
         self.fusion_projection = nn.Sequential(
-            nn.Linear(self.config.embedding_dim, self.config.hidden_dim),
+            nn.Linear(self.config.fusion_dim, self.config.hidden_dim),
             nn.GELU(),
             nn.Dropout(self.config.dropout),
-            nn.Linear(self.config.hidden_dim, self.config.embedding_dim),
+            nn.Linear(self.config.hidden_dim, self.config.fusion_dim),
             nn.Dropout(self.config.dropout)
         )
         
@@ -63,7 +91,7 @@ class FusionModel(nn.Module):
         
         # 4. Prediction Head (Regression)
         self.prediction_head = nn.Sequential(
-            nn.Linear(self.config.embedding_dim, 256),
+            nn.Linear(self.config.fusion_dim, 256),
             nn.GELU(),
             nn.Dropout(self.config.dropout),
             nn.Linear(256, 1)
@@ -101,11 +129,17 @@ class FusionModel(nn.Module):
                 "All modalities must have identical batch sizes."
             )
 
-        # C. Latent Dimension Contract
-        expected = self.config.embedding_dim
-        for name, tensor in [("Image", img), ("Text", txt), ("Tabular", tab)]:
+        # C. Per-Modality Latent Dimension Contract
+        for name, tensor, expected in [
+            ("Image",   img, self.config.image_dim),
+            ("Text",    txt, self.config.text_dim),
+            ("Tabular", tab, self.config.tabular_dim),
+        ]:
             if tensor.shape[1] != expected:
-                raise ValueError(f"DIM MISMATCH: {name} expected {expected}, got {tensor.shape[1]}.")
+                raise ValueError(
+                    f"DIM MISMATCH: {name} expected {expected}, got {tensor.shape[1]}. "
+                    f"Verify encoder.get_embedding_dim() matches FusionConfig."
+                )
 
     def _apply_modality_dropout(self, img, txt, tab) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Survival-guaranteed dropout to ensure training resilience."""

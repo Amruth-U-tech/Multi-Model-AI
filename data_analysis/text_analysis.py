@@ -63,10 +63,19 @@ print(f"   nltk       : {nltk.__version__}")
 # =============================================================================
 # %%
 
+from pathlib import Path
+
+# ── Centralized Project Root ─────────────────────────────────────────────────
+# Auto-detects Colab (mounted Drive) vs local Windows execution.
+# Change ONLY this line to reconfigure all dataset paths.
+_COLAB_ROOT = Path("/content/drive/MyDrive/multi-model-ai")
+_LOCAL_ROOT = Path("D:/multi-model-ai")
+PROJECT_ROOT = _COLAB_ROOT if _COLAB_ROOT.exists() else _LOCAL_ROOT
+
 # ── List of preprocessed CSV dataset paths ───────────────────────────────────
 CSV_FILES = [
-    "D:/multi-model-ai/preprocessed-datasets/sample_100.csv",
-    "D:/multi-model-ai/preprocessed-datasets/sample_100_2.csv",
+    str(PROJECT_ROOT / "preprocessed-datasets" / "sample_100.csv"),
+    str(PROJECT_ROOT / "preprocessed-datasets" / "sample_100_2.csv"),
 ]
 
 # ── Name of the column containing raw text ───────────────────────────────────
