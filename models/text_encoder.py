@@ -1,31 +1,31 @@
 # =============================================================================
 # text_encoder.py
-# Semantic Representation Encoder — Multimodal AI Pipeline
+# Semantic Representation Encoder -- Multimodal AI Pipeline
 # =============================================================================
 #
 # Responsibilities (this file ONLY):
 #   - Transformer forward pass (MiniLM-L6-v2)
 #   - Mean pooling over attended token embeddings
-#   - Projection head (384 → 512 → 512)
+#   - Projection head (384 -> 512 -> 512)
 #   - L2 normalization of latent embeddings
 #   - Backbone freeze / unfreeze control
 #
 # Responsibilities that live ELSEWHERE (do NOT add here):
-#   ┌─────────────────────────────┬──────────────────┐
-#   │ Responsibility              │ Correct File     │
-#   ├─────────────────────────────┼──────────────────┤
-#   │ text sanitization           │ dataset.py       │
-#   │ tokenization                │ dataset.py       │
-#   │ batching / collation        │ dataset.py       │
-#   │ attention-mask assembly     │ dataset.py       │
-#   │ modality dropout / masking  │ fusion_model.py  │
-#   │ cross-modal weighting       │ fusion_model.py  │
-#   │ train/eval mode switching   │ train.py         │
-#   │ freeze schedule orchestration│ train.py        │
-#   │ optimizer / scheduler       │ train.py         │
-#   └─────────────────────────────┴──────────────────┘
+#   +-----------------------------+---------------------------+
+#   | Responsibility              | Correct File              |
+#   +-----------------------------+---------------------------+
+#   | text sanitization           | data_pipeline/tokenization|
+#   | tokenization                | data_pipeline/tokenization|
+#   | batching / collation        | data_pipeline/collate.py  |
+#   | attention-mask assembly     | data_pipeline/collate.py  |
+#   | modality dropout / masking  | fusion.py                 |
+#   | cross-modal weighting       | fusion.py                 |
+#   | train/eval mode switching   | train.py                  |
+#   | freeze schedule orchestration| train.py                 |
+#   | optimizer / scheduler       | train.py                  |
+#   +-----------------------------+---------------------------+
 #
-# Why tokenization belongs in dataset.py and NOT here:
+# Why tokenization belongs in data_pipeline/ and NOT here:
 #   DataLoader spawns multiple worker processes. If tokenization runs inside
 #   the model's forward(), it executes on the GPU-side main process, blocking
 #   the entire training loop while workers sit idle. Tokenization in
@@ -33,8 +33,8 @@
 #   prefetch buffer, and keeps the GPU fed continuously. This is the correct
 #   multiprocessing-aware design for scalable DataLoader pipelines.
 #
-# Why modality dropout belongs in fusion_model.py and NOT here:
-#   Dropping an entire modality embedding is a cross-modal decision — it
+# Why modality dropout belongs in fusion.py and NOT here:
+#   Dropping an entire modality embedding is a cross-modal decision -- it
 #   affects how other modalities compensate. The fusion layer owns that
 #   interaction. The encoder's only job is to produce the best possible
 #   embedding from its input. Mixing fusion policy into encoder forward()
@@ -48,8 +48,8 @@
 #   - fusion-independent   (latent vectors are modality-agnostic)
 #
 # Module dependency order (critical for import-time safety):
-#   imports → constants → dataclass config → transitional utilities →
-#   projection head → encoder → factory → smoke test
+#   imports -> constants -> dataclass config -> projection head -> encoder ->
+#   factory -> smoke test
 #
 # Compatible with:
 #   - torch.utils.data.DataLoader pipelines
@@ -65,9 +65,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------
 # Google Colab + Project Import Safety
-# ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------
 PROJECT_PATH = Path("/content/drive/MyDrive/multi-model-ai")
 if str(PROJECT_PATH) not in sys.path:
     sys.path.append(str(PROJECT_PATH))
@@ -75,13 +75,13 @@ if str(PROJECT_PATH) not in sys.path:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
 # =============================================================================
 # Logging
 # =============================================================================
 
-# Module-scoped logger — NO basicConfig here.
+# Module-scoped logger -- NO basicConfig here.
 # Logging must be configured ONLY in top-level entry points (train.py / inference.py).
 # This prevents handler conflicts and duplicate outputs across multimodal modules.
 logger = logging.getLogger(__name__)
@@ -89,23 +89,23 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Global Constants
 # =============================================================================
-# Defined FIRST — TextEncoderConfig dataclass defaults reference these at
+# Defined FIRST -- TextEncoderConfig dataclass defaults reference these at
 # class-body evaluation time (import-time). Any constant used as a dataclass
 # default field MUST exist before the @dataclass decorator is reached.
 
-# ── Backbone ──────────────────────────────────────────────────────────────────
+# -- Backbone ------------------------------------------------------------------
 # MiniLM-L6-v2 chosen for:
 #   - Strong semantic quality for short-to-medium ecommerce product text
-#   - 384-dim output — lightweight enough for T4 with frozen backbone
+#   - 384-dim output -- lightweight enough for T4 with frozen backbone
 #   - Excellent zero-shot retrieval alignment out of the box
-#   - Fast inference — critical for multimodal batching throughput
+#   - Fast inference -- critical for multimodal batching throughput
 DEFAULT_MODEL_NAME  : str   = "sentence-transformers/all-MiniLM-L6-v2"
 
-# ── MiniLM backbone output dimension ─────────────────────────────────────────
-# Fixed by model architecture — do not change without swapping backbone
+# -- MiniLM backbone output dimension -----------------------------------------
+# Fixed by model architecture -- do not change without swapping backbone
 MINILM_FEATURE_DIM  : int   = 384
 
-# ── Latent space ──────────────────────────────────────────────────────────────
+# -- Latent space --------------------------------------------------------------
 # 512 chosen deliberately (vs image encoder's 256):
 #   - Text carries richer semantic density than a single product image
 #   - Larger projection gives the bottleneck room to reorganize without
@@ -113,27 +113,25 @@ MINILM_FEATURE_DIM  : int   = 384
 #   - FusionModel will project all modalities to a shared fusion dim anyway
 #   - Keeps retrieval quality and RAG compatibility strong
 DEFAULT_LATENT_DIM  : int   = 512
-DEFAULT_HIDDEN_DIM  : int   = 512   # 384→512→512: expand then stabilize
+DEFAULT_HIDDEN_DIM  : int   = 512   # 384->512->512: expand then stabilize
 
-# ── Tokenization ──────────────────────────────────────────────────────────────
+# -- Tokenization geometry (consumed by data_pipeline/tokenization.py) ---------
 # max_length=64 chosen for Amazon Fashion dataset specifically:
 #   - Sample titles average 10-25 tokens
 #   - Product identity is captured in the first 64 tokens for this domain
-#   - Critical for T4 VRAM: attention cost scales with seq_len²
+#   - Critical for T4 VRAM: attention cost scales with seq_len^2
 DEFAULT_MAX_LENGTH  : int   = 64
 
-# ── Regularization ────────────────────────────────────────────────────────────
+# -- Regularization ------------------------------------------------------------
 DEFAULT_DROPOUT     : float = 0.1
-# Lower than image encoder (0.2) — transformer attention already provides
+# Lower than image encoder (0.2) -- transformer attention already provides
 # internal regularization; excessive dropout here hurts semantic quality
 
-# ── Fallback text ─────────────────────────────────────────────────────────────
-# Used by transitional tokenizer utilities (see section below).
-# Will move to dataset.py once that file is created.
+# -- Fallback text (used by data_pipeline/tokenization.py) ---------------------
 FALLBACK_TEXT       : str   = "[NO_TEXT_AVAILABLE]"
 
 # =============================================================================
-# TextEncoderConfig — Structured Configuration
+# TextEncoderConfig -- Structured Configuration
 # =============================================================================
 
 @dataclass
@@ -152,45 +150,45 @@ class TextEncoderConfig:
         encoder = TextEncoder(config)
 
     Future centralization (no encoder changes required):
-        configs/text_encoder_config.py   ← move dataclass here
-        configs/multimodal_config.py     ← umbrella config for all encoders
+        configs/text_encoder_config.py   <- move dataclass here
+        configs/multimodal_config.py     <- umbrella config for all encoders
     """
 
-    # ── Backbone ──────────────────────────────────────────────────────────────
+    # -- Backbone --------------------------------------------------------------
     model_name           : str   = DEFAULT_MODEL_NAME
-    # HuggingFace model string — change here to swap backbone without touching
+    # HuggingFace model string -- change here to swap backbone without touching
     # encoder internals (adjust MINILM_FEATURE_DIM constant if output dim differs)
 
-    # ── Latent Space ──────────────────────────────────────────────────────────
+    # -- Latent Space ----------------------------------------------------------
     latent_dim           : int   = DEFAULT_LATENT_DIM
-    # Output embedding size — must align with FusionConfig.text_dim downstream
+    # Output embedding size -- must align with FusionConfig.text_dim downstream
     hidden_dim           : int   = DEFAULT_HIDDEN_DIM
-    # Projection bottleneck: Linear(MINILM_FEATURE_DIM → hidden_dim → latent_dim)
+    # Projection bottleneck: Linear(MINILM_FEATURE_DIM -> hidden_dim -> latent_dim)
 
-    # ── Tokenization ──────────────────────────────────────────────────────────
+    # -- Tokenization ----------------------------------------------------------
     max_length           : int   = DEFAULT_MAX_LENGTH
-    # Token sequence cap — directly controls VRAM and batch latency.
-    # Consumed by dataset.py tokenization; stored here so config is the
+    # Token sequence cap -- directly controls VRAM and batch latency.
+    # Consumed by data_pipeline/tokenization.py; stored here so config is the
     # single source of truth for the entire text preprocessing geometry.
 
-    # ── Regularization ────────────────────────────────────────────────────────
+    # -- Regularization --------------------------------------------------------
     dropout              : float = DEFAULT_DROPOUT
 
-    # ── Embedding Geometry ────────────────────────────────────────────────────
+    # -- Embedding Geometry ----------------------------------------------------
     normalize_embeddings : bool  = True
     # L2-normalize output to unit sphere.
     # CRITICAL: prevents text magnitude from dominating image/tabular embeddings
     # in concatenation or attention-based fusion. Also required for cosine
     # retrieval and contrastive alignment losses.
 
-    # ── Training Control ──────────────────────────────────────────────────────
+    # -- Training Control ------------------------------------------------------
     freeze_backbone      : bool  = True
-    # ⚠️  CRITICAL MULTIMODAL DESIGN DECISION — read carefully before changing.
+    # CRITICAL MULTIMODAL DESIGN DECISION -- read carefully before changing.
     #
     # WHY freeze initially:
     #   MiniLM produces highly dominant semantic representations out of the box.
     #   If the transformer is unfrozen from epoch 1, text gradients overpower
-    #   image and tabular gradients during fusion — the model collapses into a
+    #   image and tabular gradients during fusion -- the model collapses into a
     #   language-only learner. Freezing forces the system to learn multimodal
     #   fusion using fixed, stable semantic anchors first.
     #
@@ -201,156 +199,35 @@ class TextEncoderConfig:
     #   No architecture changes or config rewrites needed.
     #
     # HOW train.py will orchestrate this:
-    #   phase_1: TextEncoderConfig(freeze_backbone=True)   ← head-only training
-    #   phase_2: encoder.unfreeze_backbone(num_layers=2)   ← staged fine-tuning
-    #   phase_3: encoder.unfreeze_backbone()               ← full fine-tuning
+    #   phase_1: TextEncoderConfig(freeze_backbone=True)   <- head-only training
+    #   phase_2: encoder.unfreeze_backbone(num_layers=2)   <- staged fine-tuning
+    #   phase_3: encoder.unfreeze_backbone()               <- full fine-tuning
 
-    # ── Modality Dropout Hook ─────────────────────────────────────────────────
+    # -- Modality Dropout Hook -------------------------------------------------
     modality_dropout_prob: float = 0.1
-    # ⚠️  Config field preserved for future fusion_model.py consumption.
+    # Config field preserved for future fusion.py consumption.
     #
     # WHY this field exists here but execution is NOT here:
     #   Dropping an entire modality embedding is a cross-modal fusion decision.
     #   The encoder's job is to produce the best possible embedding from its
-    #   input — it should not decide whether that embedding gets used.
-    #   fusion_model.py will read config.modality_dropout_prob and apply
+    #   input -- it should not decide whether that embedding gets used.
+    #   fusion.py will read config.modality_dropout_prob and apply
     #   the mask AFTER receiving embeddings from all encoders.
     #
     # Set to 0.0 to disable modality dropout entirely.
 
 # =============================================================================
-# Transitional Tokenizer Utilities
+# Tokenization Ownership -- MIGRATED
 # =============================================================================
-# ⚠️  TRANSITIONAL — these utilities will migrate to dataset.py once created.
+# sanitize_text(), load_tokenizer(), and tokenize_batch() have been migrated to:
 #
-# WHY they are here temporarily:
-#   dataset.py does not yet exist. These helpers are needed now for the
-#   smoke test and for notebook/inference use cases. Once dataset.py is
-#   implemented, sanitize_text() and tokenize_batch() move there wholesale,
-#   and these copies are deleted from this file.
+#   data_pipeline/tokenization.py
 #
-# WHY they must eventually live in dataset.py:
-#   Tokenization must happen inside Dataset.__getitem__() so DataLoader
-#   worker processes can parallelize it across CPU cores. If tokenization
-#   runs during the model forward pass, it serializes on the main process
-#   and starves the GPU. Pre-tokenizing in the dataset fills the prefetch
-#   buffer efficiently and keeps training throughput high.
-#
-# DO NOT build new logic on top of these functions — treat them as temporary.
+# That module is now the SINGLE TOKENIZATION AUTHORITY for the project.
+# Usage:
+#   from data_pipeline.tokenization import sanitize_text, load_tokenizer
+#   from data_pipeline.tokenization import tokenize_batch
 # =============================================================================
-
-def sanitize_text(text: Union[str, float, int, None]) -> str:
-    """
-    [TRANSITIONAL — will move to dataset.py]
-
-    Converts any input to a clean, tokenizer-safe string.
-
-    Handles:
-      - None values                        (missing CSV cells)
-      - float NaN (pandas missing-value)   (missing CSV cells)
-      - Non-string types (int, float)      (numeric columns read as text)
-      - Empty strings after stripping      (blank descriptions)
-
-    Returns FALLBACK_TEXT for anything that reduces to empty — never returns
-    an empty string, which causes tokenizers to produce degenerate embeddings.
-
-    Args:
-        text : Raw value from a dataset row.
-
-    Returns:
-        Non-empty string guaranteed safe for tokenization.
-    """
-    if text is None:
-        return FALLBACK_TEXT
-    try:
-        # float NaN check: NaN != NaN is the only reliable identity test
-        if isinstance(text, float) and (text != text):
-            return FALLBACK_TEXT
-    except Exception:
-        pass
-    cleaned = str(text).strip()
-    return cleaned if cleaned else FALLBACK_TEXT
-
-
-def load_tokenizer(model_name: str = DEFAULT_MODEL_NAME) -> AutoTokenizer:
-    """
-    [TRANSITIONAL — will move to dataset.py]
-
-    Loads and returns the HuggingFace tokenizer for the given model.
-
-    Separated from the encoder class so dataset.py can pre-load the
-    tokenizer once in Dataset.__init__() and reuse it across all
-    __getitem__ calls — avoids re-initializing per batch.
-
-    Args:
-        model_name : HuggingFace model identifier.
-
-    Returns:
-        AutoTokenizer instance.
-    """
-    logger.info(f"Loading tokenizer: '{model_name}'")
-    tok = AutoTokenizer.from_pretrained(model_name)
-    logger.info("Tokenizer loaded.")
-    return tok
-
-
-def tokenize_batch(
-    texts     : List[str],
-    tokenizer : AutoTokenizer,
-    max_length: int,
-    device    : Optional[torch.device] = None,
-) -> Dict[str, torch.Tensor]:
-    """
-    [TRANSITIONAL — will move to dataset.py]
-
-    Tokenizes a list of sanitized strings into padded, truncated tensors.
-
-    When this migrates to dataset.py it will be called inside __getitem__()
-    per sample (returning individual token tensors), with DataLoader's default
-    collate assembling them into batches. The current batch-level signature is
-    retained for smoke test and inference compatibility.
-
-    Args:
-        texts      : List of sanitized strings (run through sanitize_text first).
-        tokenizer  : Pre-loaded AutoTokenizer instance.
-        max_length : Maximum token sequence length.
-        device     : If provided, tensors are moved here before return.
-
-    Returns:
-        Dict with keys "input_ids" and "attention_mask" — both (B, max_length).
-
-    Raises:
-        ValueError : If texts list is empty.
-    """
-    if not texts:
-        raise ValueError("tokenize_batch() received an empty text list.")
-
-    try:
-        encoded = tokenizer(
-            texts,
-            padding               = "max_length",
-            truncation            = True,
-            max_length            = max_length,
-            return_tensors        = "pt",
-            return_attention_mask = True,
-        )
-    except Exception as exc:
-        logger.warning(
-            f"Tokenization failed: {exc}. Replacing batch with fallback tokens."
-        )
-        encoded = tokenizer(
-            [FALLBACK_TEXT] * len(texts),
-            padding               = "max_length",
-            truncation            = True,
-            max_length            = max_length,
-            return_tensors        = "pt",
-            return_attention_mask = True,
-        )
-
-    if device is not None:
-        encoded = {k: v.to(device) for k, v in encoded.items()}
-
-    return encoded
 
 # =============================================================================
 # Projection Head
@@ -361,11 +238,11 @@ class ProjectionHead(nn.Module):
     Two-layer MLP that shapes MiniLM features into the multimodal latent space.
 
     Architecture:
-        Linear(in_dim → hidden_dim) → GELU → Dropout → Linear(hidden_dim → latent_dim)
+        Linear(in_dim -> hidden_dim) -> GELU -> Dropout -> Linear(hidden_dim -> latent_dim)
 
-    For text: 384 → 512 → 512
-      - Expansion (384→512) gives the head room to reorganize features rather
-        than compress them — MiniLM is already compact; further compression
+    For text: 384 -> 512 -> 512
+      - Expansion (384->512) gives the head room to reorganize features rather
+        than compress them -- MiniLM is already compact; further compression
         loses semantic resolution needed for retrieval and RAG
       - GELU: smoother gradients; standard for transformer-adjacent components
       - Dropout: regularizes the bottleneck; helps prevent latent collapse
@@ -397,7 +274,7 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 # =============================================================================
-# TextEncoder — Main Module
+# TextEncoder -- Main Module
 # =============================================================================
 
 class TextEncoder(nn.Module):
@@ -407,34 +284,34 @@ class TextEncoder(nn.Module):
     This encoder owns EXACTLY:
       - Transformer backbone (MiniLM-L6-v2)
       - Mean pooling over attended token embeddings
-      - Projection head (384 → 512 → 512)
+      - Projection head (384 -> 512 -> 512)
       - L2 normalization
       - Backbone freeze / unfreeze control
 
     This encoder does NOT own:
-      - Text sanitization or tokenization   → dataset.py
-      - Modality dropout / masking          → fusion_model.py
-      - train/eval mode switching           → train.py
-      - Freeze schedule orchestration       → train.py
-      - Optimizer / scheduler               → train.py
+      - Text sanitization or tokenization   -> data_pipeline/tokenization.py
+      - Modality dropout / masking          -> fusion.py
+      - train/eval mode switching           -> train.py
+      - Freeze schedule orchestration       -> train.py
+      - Optimizer / scheduler               -> train.py
 
     Architecture:
-        input_ids + attention_mask (B, seq_len)  ← pre-tokenized by dataset.py
-             ↓
+        input_ids + attention_mask (B, seq_len)  <- pre-tokenized by tokenization.py
+             |
         MiniLM-L6-v2 Transformer (optionally frozen)
-             ↓
-        Mean pooling over attended tokens → (B, 384)
-             ↓
-        ProjectionHead: Linear(384→512) → GELU → Dropout → Linear(512→512)
-             ↓
+             |
+        Mean pooling over attended tokens -> (B, 384)
+             |
+        ProjectionHead: Linear(384->512) -> GELU -> Dropout -> Linear(512->512)
+             |
         Latent Embedding (B, latent_dim)
-             ↓
-        Optional L2 Normalization → unit-sphere embedding
+             |
+        Optional L2 Normalization -> unit-sphere embedding
 
     Why mean pooling over [CLS]:
       [CLS] works well for classification but mean pooling over attended tokens
       produces more uniform, retrieval-stable embeddings for variable-length
-      ecommerce product text — especially short titles where [CLS] underfits.
+      ecommerce product text -- especially short titles where [CLS] underfits.
       This also matches how sentence-transformers officially uses MiniLM.
 
     Args:
@@ -444,7 +321,7 @@ class TextEncoder(nn.Module):
     def __init__(self, config: Optional[TextEncoderConfig] = None) -> None:
         super().__init__()
 
-        # ── Resolve config safely — avoids mutable default argument bug ───────
+        # -- Resolve config safely -- avoids mutable default argument bug ------
         # Never use `config: TextEncoderConfig = TextEncoderConfig()` as a
         # default argument. Python evaluates that object ONCE at definition time,
         # creating shared state across all callers. Use None + internal init.
@@ -455,23 +332,16 @@ class TextEncoder(nn.Module):
         self.latent_dim = config.latent_dim
         self.normalize  = config.normalize_embeddings
 
-        # ── Tokenizer ─────────────────────────────────────────────────────────
-        # Stored on encoder so inference.py / notebooks can access it via
-        # encoder.tokenizer without a separate import.
-        # In the full pipeline, dataset.py will load its own tokenizer instance
-        # independently — two instances is correct (one per process boundary).
-        logger.info(f"Loading tokenizer and backbone: '{config.model_name}'")
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-
-        # ── Transformer backbone ──────────────────────────────────────────────
+        # -- Transformer backbone ----------------------------------------------
+        logger.info(f"Loading backbone: '{config.model_name}'")
         self.backbone = AutoModel.from_pretrained(config.model_name)
         logger.info(f"Backbone loaded | output_dim={MINILM_FEATURE_DIM}")
 
-        # ── Selective backbone freezing ───────────────────────────────────────
+        # -- Selective backbone freezing ---------------------------------------
         if config.freeze_backbone:
             self._freeze_backbone()
 
-        # ── Projection head ───────────────────────────────────────────────────
+        # -- Projection head ---------------------------------------------------
         self.projection = ProjectionHead(
             in_dim     = MINILM_FEATURE_DIM,
             hidden_dim = config.hidden_dim,
@@ -499,13 +369,13 @@ class TextEncoder(nn.Module):
         the text backbone is frozen entirely in phase 1 because:
 
           MiniLM's pretrained sentence embeddings are already semantically
-          aligned for ecommerce product text — partial freezing at a layer
+          aligned for ecommerce product text -- partial freezing at a layer
           boundary introduces gradient instability with minimal benefit.
           The projection head alone is sufficient to adapt the latent geometry
           for multimodal fusion during warm-up.
 
         train.py controls when to unfreeze via encoder.unfreeze_backbone().
-        No architecture changes needed — only a config flag or a method call.
+        No architecture changes needed -- only a config flag or a method call.
         """
         for param in self.backbone.parameters():
             param.requires_grad = False
@@ -519,7 +389,7 @@ class TextEncoder(nn.Module):
         """
         Progressively unfreezes transformer layers for staged fine-tuning.
 
-        Called by train.py — never called inside this encoder's own logic.
+        Called by train.py -- never called inside this encoder's own logic.
         This keeps fine-tuning schedule ownership strictly in train.py.
 
         Args:
@@ -550,7 +420,7 @@ class TextEncoder(nn.Module):
                 for param in self.backbone.parameters():
                     param.requires_grad = True
                 logger.warning(
-                    "backbone.encoder.layer not found — unfroze full backbone. "
+                    "backbone.encoder.layer not found -- unfroze full backbone. "
                     "Override unfreeze_backbone() for non-BERT-family architectures."
                 )
 
@@ -575,12 +445,12 @@ class TextEncoder(nn.Module):
         """
         Attention-mask-weighted mean over token embeddings.
 
-        Ignores padding tokens in the mean — critical for variable-length
+        Ignores padding tokens in the mean -- critical for variable-length
         product titles where padding can dominate the average if unmasked.
 
         Args:
             token_embeddings : (B, seq_len, hidden_dim) from transformer last layer.
-            attention_mask   : (B, seq_len) — 1 for real tokens, 0 for padding.
+            attention_mask   : (B, seq_len) -- 1 for real tokens, 0 for padding.
 
         Returns:
             Pooled tensor (B, hidden_dim).
@@ -598,7 +468,7 @@ class TextEncoder(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def get_embedding_dim(self) -> int:
-        """Returns latent_dim — used by FusionModel to validate input contracts."""
+        """Returns latent_dim -- used by FusionModel to validate input contracts."""
         return self.latent_dim
 
     # =========================================================================
@@ -613,21 +483,22 @@ class TextEncoder(nn.Module):
         """
         Encodes pre-tokenized inputs into latent semantic embeddings.
 
-        Accepts ONLY pre-tokenized tensors — raw string handling belongs in
-        dataset.py. This boundary ensures the encoder is DataLoader-safe and
-        testable in isolation without any preprocessing dependencies.
+        Accepts ONLY pre-tokenized tensors -- raw string handling belongs in
+        data_pipeline/tokenization.py. This boundary ensures the encoder is
+        DataLoader-safe and testable in isolation without any preprocessing
+        dependencies.
 
-        Modality dropout is NOT applied here — fusion_model.py applies it
+        Modality dropout is NOT applied here -- fusion.py applies it
         after receiving embeddings from all encoders, because it is a
         cross-modal interaction decision, not a representation decision.
 
         train.py is responsible for calling encoder.train() / encoder.eval()
-        at the correct points in the training loop — the encoder itself does
+        at the correct points in the training loop -- the encoder itself does
         not manage its own training mode transitions.
 
         Args:
-            input_ids      : Long tensor (B, seq_len) from dataset.py tokenizer.
-            attention_mask : Long tensor (B, seq_len) — 1=real token, 0=padding.
+            input_ids      : Long tensor (B, seq_len) from tokenization.py.
+            attention_mask : Long tensor (B, seq_len) -- 1=real token, 0=padding.
 
         Returns:
             embeddings : Float tensor (B, latent_dim).
@@ -636,7 +507,7 @@ class TextEncoder(nn.Module):
         Raises:
             ValueError : If tensors are not 2D, shapes don't match, or batch is empty.
         """
-        # ── Input validation ──────────────────────────────────────────────────
+        # -- Input validation --------------------------------------------------
         if input_ids.ndim != 2:
             raise ValueError(
                 f"TextEncoder.forward() expected 2D input_ids (B, seq_len), "
@@ -650,77 +521,23 @@ class TextEncoder(nn.Module):
         if input_ids.shape[0] == 0:
             raise ValueError("TextEncoder.forward() received empty batch (B=0).")
 
-        # ── Transformer forward pass → (B, seq_len, 384) ─────────────────────
+        # -- Transformer forward pass -> (B, seq_len, 384) --------------------
         output = self.backbone(
             input_ids      = input_ids,
             attention_mask = attention_mask,
         )
 
-        # ── Mean pooling → (B, 384) ───────────────────────────────────────────
+        # -- Mean pooling -> (B, 384) ------------------------------------------
         features = self._mean_pool(output.last_hidden_state, attention_mask)
 
-        # ── Projection → (B, latent_dim) ──────────────────────────────────────
+        # -- Projection -> (B, latent_dim) -------------------------------------
         embeddings = self.projection(features)
 
-        # ── L2 normalization → unit sphere ────────────────────────────────────
+        # -- L2 normalization -> unit sphere -----------------------------------
         # Prevents text magnitude from dominating image/tabular in fusion.
         # Required for cosine retrieval and contrastive alignment losses.
         if self.normalize:
             embeddings = F.normalize(embeddings, p=2, dim=1)
-
-        return embeddings
-
-    # =========================================================================
-    # Convenience Encoder (Inference / Notebooks / SHAP)
-    # =========================================================================
-
-    @torch.no_grad()
-    def encode_texts(
-        self,
-        texts  : Union[str, List[str]],
-        device : Optional[torch.device] = None,
-    ) -> torch.Tensor:
-        """
-        Convenience method for encoding raw strings outside a DataLoader context.
-
-        Uses the transitional tokenizer utilities internally. Once dataset.py
-        exists, inference.py will construct its own Dataset + DataLoader for
-        batch inference — this method remains useful for notebooks, SHAP, and
-        single-sample retrieval queries.
-
-        NOT intended for training loops — use forward() with DataLoader tensors.
-
-        Args:
-            texts  : A single string or list of strings.
-            device : Device to run on. If None, inferred from encoder parameters.
-
-        Returns:
-            embeddings : Float tensor (B, latent_dim), L2-normalized.
-        """
-        if isinstance(texts, str):
-            texts = [texts]
-
-        texts = [sanitize_text(t) for t in texts]
-
-        if device is None:
-            device = next(self.parameters()).device
-
-        encoded = tokenize_batch(
-            texts      = texts,
-            tokenizer  = self.tokenizer,
-            max_length = self.config.max_length,
-            device     = device,
-        )
-
-        # Ensure eval mode for inference — modality dropout inactive,
-        # projection dropout inactive, deterministic output.
-        # train.py manages mode transitions in the training loop;
-        # encode_texts() is inference-only so eval mode is always correct here.
-        was_training = self.training
-        self.eval()
-        embeddings = self(encoded["input_ids"], encoded["attention_mask"])
-        if was_training:
-            self.train()
 
         return embeddings
 
@@ -733,7 +550,7 @@ def build_text_encoder(config: Optional[TextEncoderConfig] = None) -> "TextEncod
     Clean factory entry point for train.py, inference.py, and notebooks.
     Follows the identical pattern as build_encoder() in image_encoder.py.
 
-    The None default is intentional — avoids the mutable default argument trap.
+    The None default is intentional -- avoids the mutable default argument trap.
     A fresh TextEncoderConfig() is created inside TextEncoder.__init__ if
     no config is passed.
 
@@ -747,95 +564,107 @@ def build_text_encoder(config: Optional[TextEncoderConfig] = None) -> "TextEncod
         # DataLoader-style (primary training path):
         emb = encoder(input_ids, attention_mask)          # (B, 512)
 
-        # Convenience / inference / SHAP:
-        emb = encoder.encode_texts(["product title"])     # (1, 512)
-
     Args:
         config : TextEncoderConfig or None (defaults applied internally).
 
     Returns:
-        TextEncoder on CPU — caller is responsible for .to(device).
+        TextEncoder on CPU -- caller is responsible for .to(device).
     """
     return TextEncoder(config)
 
 # =============================================================================
-# Smoke Test  —  python text_encoder.py
+# Smoke Test  --  python text_encoder.py
 # =============================================================================
 
 if __name__ == "__main__":
 
-    # ── Configure logging for smoke test only ─────────────────────────────────
+    # -- Configure logging for smoke test only ---------------------------------
     # In production this lives in train.py / inference.py, NOT in module scope.
     logging.basicConfig(
         level  = logging.INFO,
-        format = "[%(asctime)s] [%(levelname)s] %(name)s — %(message)s",
+        format = "[%(asctime)s] [%(levelname)s] %(name)s -- %(message)s",
         datefmt= "%H:%M:%S",
     )
 
     logger.info("=" * 60)
-    logger.info("  text_encoder.py — smoke test")
+    logger.info("  text_encoder.py -- smoke test")
     logger.info("=" * 60)
 
     try:
+        # Import tokenization from the centralized authority
+        from data_pipeline.tokenization import (
+            sanitize_text,
+            load_tokenizer,
+            tokenize_batch,
+            validate_tokenized_output,
+        )
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Device: {device}")
 
-        # ── Config and encoder ────────────────────────────────────────────────────
+        # -- Config and encoder ------------------------------------------------
         config  = TextEncoderConfig(latent_dim=512, freeze_backbone=True)
         encoder = build_text_encoder(config)
         encoder.to(device)
         encoder.eval()
 
-        # ── sanitize_text edge cases ──────────────────────────────────────────────
+        # -- Load tokenizer from centralized authority -------------------------
+        logger.info("Loading tokenizer from data_pipeline.tokenization...")
+        tok = load_tokenizer(config.model_name)
+
+        # -- sanitize_text edge cases (now in data_pipeline) -------------------
         logger.info("Testing sanitize_text() edge cases...")
         assert sanitize_text(None)          == FALLBACK_TEXT
         assert sanitize_text("")            == FALLBACK_TEXT
-        assert sanitize_text("   ")        == FALLBACK_TEXT
-        assert sanitize_text(float("nan")) == FALLBACK_TEXT
-        assert sanitize_text(42)           == "42"
-        assert sanitize_text(3.14)         == "3.14"
-        logger.info("sanitize_text(): PASSED  ✅")
+        assert sanitize_text("   ")         == FALLBACK_TEXT
+        assert sanitize_text(float("nan"))  == FALLBACK_TEXT
+        assert sanitize_text(42)            == "42"
+        assert sanitize_text(3.14)          == "3.14"
+        logger.info("sanitize_text(): PASSED")
 
-        # ── Realistic Amazon Fashion product titles ───────────────────────────────
+        # -- Realistic Amazon Fashion product titles ---------------------------
         raw_texts = [
             "Spanx Core In-Power Line Super High Shaping Sheers Very Black F",
             "KingSize Men's Big & Tall Lightweight Jersey Cargo Sweatpants",
             "Boho Tassel Earrings for Women Girls Multicolor Bohemian Fan Statement",
-            "",    # Edge Case — becomes FALLBACK_TEXT
+            "",    # Edge Case -- becomes FALLBACK_TEXT
         ]
         clean = [sanitize_text(t) for t in raw_texts]
 
-        # ── encode_texts convenience method ───────────────────────────────────────
-        logger.info("Testing encode_texts() with Amazon product titles...")
-        emb = encoder.encode_texts(clean, device=device)
-        assert emb.shape == (4, config.latent_dim), f"Shape mismatch: {emb.shape}"
-        logger.info(f"encode_texts() shape : {tuple(emb.shape)}  ✅")
-
-        # ── L2 normalization ──────────────────────────────────────────────────────
-        norms = emb.norm(dim=1)
-        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
-        logger.info(f"Norms (≈ 1.0)        : {[round(n,4) for n in norms.tolist()]}  ✅")
-
-        # ── DataLoader-style forward pass (primary training path) ─────────────────
+        # -- DataLoader-style forward pass (primary training path) -------------
         logger.info("Testing DataLoader-style forward pass...")
         encoded = tokenize_batch(
             texts      = clean,
-            tokenizer  = encoder.tokenizer,
+            tokenizer  = tok,
             max_length = config.max_length,
-            device     = device,
         )
-        with torch.no_grad():
-            emb2 = encoder(encoded["input_ids"], encoded["attention_mask"])
-        assert emb2.shape == (4, config.latent_dim), f"Forward shape mismatch: {emb2.shape}"
-        logger.info(f"forward() shape      : {tuple(emb2.shape)}  ✅")
+        validate_tokenized_output(encoded, expected_batch_size=4, max_length=config.max_length)
 
-        # ── Trainable parameter count ─────────────────────────────────────────────
+        # Move to device for encoder forward pass
+        input_ids = encoded["input_ids"].to(device)
+        attention_mask = encoded["attention_mask"].to(device)
+
+        with torch.no_grad():
+            emb = encoder(input_ids, attention_mask)
+        assert emb.shape == (4, config.latent_dim), f"Shape mismatch: {emb.shape}"
+        logger.info(f"forward() shape      : {tuple(emb.shape)}  PASS")
+
+        # -- L2 normalization --------------------------------------------------
+        norms = emb.norm(dim=1)
+        assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+        logger.info(f"Norms (approx 1.0)   : {[round(n,4) for n in norms.tolist()]}  PASS")
+
+        # -- Interface symmetry ------------------------------------------------
+        assert encoder.get_embedding_dim() == 512
+        logger.info(f"get_embedding_dim    : {encoder.get_embedding_dim()}  PASS")
+
+        # -- Trainable parameter count -----------------------------------------
         logger.info(f"Trainable params     : {encoder._count_trainable_params():,}")
 
         logger.info("=" * 60)
-        logger.info("  ✅  Smoke test PASSED — TextEncoder is integration-ready.")
+        logger.info("  PASS  Smoke test PASSED -- TextEncoder is integration-ready.")
         logger.info("=" * 60)
 
     except Exception as e:
-        logger.exception(f"❌ SMOKE TEST FAILED: {e}")
-        sys.exit(1)
+        logger.exception(f"[FAIL] SMOKE TEST FAILED: {e}")
+        sys.exit(1)
