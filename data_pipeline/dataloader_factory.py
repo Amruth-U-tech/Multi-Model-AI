@@ -822,6 +822,21 @@ def build_train_val_dataloaders(
             execution_mode=train_loader_config.execution_mode,
         )
 
+    # Leakage guard: fail loudly if both configs resolve to same source
+    t_cfg = train_dataset_config or DatasetConfig()
+    v_cfg = val_dataset_config or DatasetConfig()
+    t_csv = getattr(t_cfg, "csv_filename", None)
+    v_csv = getattr(v_cfg, "csv_filename", None)
+    if t_csv is not None and v_csv is not None and t_csv == v_csv:
+        raise ValueError(_dataloader_error(
+            "train_val_loader_build",
+            "Train and validation datasets resolve to the same CSV source.",
+            resolution=(
+                "Provide separate train/val DatasetConfig objects with "
+                "distinct csv_filename values or pre-split files."
+            ),
+        ))
+
     train_loader, train_report = build_dataloader(
         dataset_config=train_dataset_config,
         collate_config=collate_config,

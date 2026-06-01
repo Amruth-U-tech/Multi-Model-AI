@@ -69,6 +69,11 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+def _shape_str(tensor: torch.Tensor) -> str:
+    """Flatten tensor shape to a lightweight string like '3x224x224'."""
+    return "x".join(str(d) for d in tensor.shape)
+
+
 # =============================================================================
 # 3. Error helper
 # =============================================================================
@@ -796,11 +801,12 @@ def _build_manifest(
     for key in ("images", "input_ids", "attention_mask", "tabular", "ratings"):
         t = batch.get(key)
         if isinstance(t, torch.Tensor):
-            shapes[key] = list(t.shape)
+            shapes[key] = _shape_str(t)
             dtypes[key] = str(t.dtype)
 
     B = len(sample_ids)
-    max_token_length = shapes.get("input_ids", [0, 0])[-1] if "input_ids" in shapes else 0
+    ids_tensor = batch.get("input_ids")
+    max_token_length = ids_tensor.shape[-1] if isinstance(ids_tensor, torch.Tensor) and ids_tensor.ndim >= 1 else 0
 
     return {
         "batch_size": B,
@@ -994,7 +1000,7 @@ class BatchCollator:
         t_img = (_now_ms() - t0) if t0 else None
         collate_trace.append(self._trace_event(
             "image_stack", "ok", t_img,
-            details={"shape": list(images.shape)},
+            details={"shape": _shape_str(images)},
         ))
 
         # -- 4. Stack text ------------------------------------------------
@@ -1003,7 +1009,7 @@ class BatchCollator:
         t_txt = (_now_ms() - t0) if t0 else None
         collate_trace.append(self._trace_event(
             "text_stack", "ok", t_txt,
-            details={"shape": list(input_ids.shape)},
+            details={"shape": _shape_str(input_ids)},
         ))
 
         # -- 5. Stack tabular ---------------------------------------------
@@ -1012,7 +1018,7 @@ class BatchCollator:
         t_tab = (_now_ms() - t0) if t0 else None
         collate_trace.append(self._trace_event(
             "tabular_stack", "ok", t_tab,
-            details={"shape": list(tabular.shape)},
+            details={"shape": _shape_str(tabular)},
         ))
 
         # -- 6. Stack ratings ---------------------------------------------
@@ -1021,7 +1027,7 @@ class BatchCollator:
         t_rat = (_now_ms() - t0) if t0 else None
         collate_trace.append(self._trace_event(
             "target_stack", "ok", t_rat,
-            details={"shape": list(ratings.shape)},
+            details={"shape": _shape_str(ratings)},
         ))
 
         # -- 7. Validate final batch contract -----------------------------
