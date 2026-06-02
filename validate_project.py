@@ -14,7 +14,8 @@
 #   python validate_project.py --quick      # skip heavy model/dataset checks
 #   python validate_project.py --full       # include all checks
 #   python validate_project.py --run-smoke  # also run local smoke tests
-#   python validate_project.py --json       # output JSON summary
+#   python validate_project.py --json       # print JSON summary to stdout
+#   python validate_project.py --json-out report.json  # write JSON to file
 #
 # Safety:
 #   - Read-only: no files modified, no datasets created, no training
@@ -66,18 +67,32 @@ class ValidationResult:
 
 
 class ValidationTracker:
-    """Accumulates results and produces summary."""
+    """Accumulates results and produces summary with section timing."""
 
     def __init__(self):
         self.results: List[ValidationResult] = []
         self._current_section = ""
         self._section_start = 0.0
         self._total_start = time.perf_counter()
+        self.section_durations_ms: Dict[str, float] = {}
+        self._section_order: List[str] = []
+
+    def _finalize_section(self):
+        """Record duration for the current section before starting a new one."""
+        if self._current_section:
+            elapsed = (time.perf_counter() - self._section_start) * 1000.0
+            self.section_durations_ms[self._current_section] = elapsed
 
     def section(self, name: str):
+        self._finalize_section()
         self._current_section = name
         self._section_start = time.perf_counter()
+        self._section_order.append(name)
         print(f"\n  {name}...")
+
+    def finalize(self):
+        """Finalize the last active section. Call before summary."""
+        self._finalize_section()
 
     def check(self, name: str, condition: bool, detail: str = ""):
         status = "PASS" if condition else "FAIL"
@@ -123,6 +138,11 @@ class ValidationTracker:
     def total_time_ms(self) -> float:
         return (time.perf_counter() - self._total_start) * 1000.0
 
+    def slowest_section(self) -> str:
+        if not self.section_durations_ms:
+            return "N/A"
+        return max(self.section_durations_ms, key=self.section_durations_ms.get)
+
     def readiness_score(self) -> int:
         c = self.counts
         total = c["PASS"] + c["FAIL"] + c["EXPECTED"] + c["WARN"]
@@ -142,6 +162,8 @@ class ValidationTracker:
             "summary": self.counts,
             "readiness_score": self.readiness_score(),
             "total_time_ms": round(self.total_time_ms, 2),
+            "section_timings_ms": {k: round(v, 1) for k, v in self.section_durations_ms.items()},
+            "slowest_section": self.slowest_section(),
         }, indent=2)
 
 
@@ -155,33 +177,36 @@ def validate_environment(t: ValidationTracker):
     t.check("Python >= 3.8", sys.version_info >= (3, 8), f"got {sys.version_info}")
     t.check("Platform detected", bool(platform.system()), platform.system())
 
-    # Machine summary
+    # ── Machine Summary ──────────────────────────────────────────────────
     import multiprocessing
     cpu_count = multiprocessing.cpu_count()
     print(f"           CPU cores       : {cpu_count}")
     print(f"           Platform        : {platform.platform()}")
     print(f"           Python          : {sys.version.split()[0]}")
 
-    # RAM estimate
+    # RAM estimate (psutil optional)
     try:
         import psutil
         ram_gb = round(psutil.virtual_memory().total / (1024**3), 1)
         print(f"           RAM             : {ram_gb} GB")
     except ImportError:
-        print(f"           RAM             : (psutil not installed)")
+        print(f"           RAM             : unknown (psutil not installed)")
 
-    # CUDA / torch
+    # ── CUDA / torch ─────────────────────────────────────────────────────
     try:
         import torch
         t.check("torch imported", True)
         print(f"           torch version   : {torch.__version__}")
         cuda_avail = torch.cuda.is_available()
+        print(f"           CUDA available  : {cuda_avail}")
         if cuda_avail:
+            gpu_count = torch.cuda.device_count()
             gpu_name = torch.cuda.get_device_name(0)
-            print(f"           CUDA device     : {gpu_name}")
+            print(f"           GPU             : {gpu_name}")
+            print(f"           CUDA devices    : {gpu_count}")
             t.check("CUDA available", True)
         else:
-            print(f"           CUDA            : not available")
+            print(f"           GPU             : unavailable")
             t.warn("CUDA not available", "GPU training will not work")
     except ImportError:
         t.fail("torch imported", "torch not installed")
@@ -580,18 +605,66 @@ def validate_smoke_tests(t: ValidationTracker, run_smoke: bool = False):
 # Stage 9: Timing + Summary
 # =============================================================================
 
-def print_summary(t: ValidationTracker, output_json: bool = False):
+def _validate_json_out_path(raw_path: str) -> Path:
+    """
+    Validate --json-out target path for filesystem safety.
+    Rejects directories, traversal attempts, and ensures parent exists.
+    """
+    p = Path(raw_path)
+
+    # Reject directory targets
+    if p.is_dir():
+        raise ValueError(
+            f"--json-out target is a directory, not a file: {p}"
+        )
+
+    # Reject traversal in relative paths
+    if not p.is_absolute():
+        resolved = (_PROJECT_ROOT / p).resolve()
+        if not str(resolved).startswith(str(_PROJECT_ROOT.resolve())):
+            raise ValueError(
+                f"--json-out path escapes project root via traversal: {raw_path}"
+            )
+        p = resolved
+    else:
+        p = p.resolve()
+
+    # Ensure parent directory exists (do NOT create arbitrary dirs)
+    if not p.parent.exists():
+        raise ValueError(
+            f"--json-out parent directory does not exist: {p.parent}"
+        )
+
+    return p
+
+
+def print_summary(
+    t: ValidationTracker,
+    print_json: bool = False,
+    json_out_path: Optional[str] = None,
+):
+    t.finalize()  # lock final section timing
+
     c = t.counts
     score = t.readiness_score()
     total_ms = t.total_time_ms
+    slowest = t.slowest_section()
+    slowest_ms = t.section_durations_ms.get(slowest, 0.0)
 
-    # Find slowest section
-    section_times: Dict[str, float] = {}
-    for r in t.results:
-        section_times[r.section] = section_times.get(r.section, 0) + r.duration_ms
-    # We don't have per-result timing currently, so show total
-    slowest = max(section_times, key=section_times.get) if section_times else "N/A"
+    # ── Validation Timing Summary ─────────────────────────────────────
+    print("\n" + "-" * 64)
+    print("  VALIDATION TIMING SUMMARY")
+    print("-" * 64)
+    print(f"  Total validation time : {total_ms:.0f} ms")
+    print(f"  Slowest stage         : {slowest} ({slowest_ms:.0f} ms)")
+    print(f"  Stage timings:")
+    for section_name in t._section_order:
+        dur = t.section_durations_ms.get(section_name, 0.0)
+        marker = " <<" if section_name == slowest else ""
+        print(f"    {section_name:40s} {dur:8.0f} ms{marker}")
+    print("-" * 64)
 
+    # ── Results Summary ───────────────────────────────────────────────
     print("\n" + "=" * 64)
     print("  PROJECT VALIDATION SUMMARY")
     print("=" * 64)
@@ -621,11 +694,18 @@ def print_summary(t: ValidationTracker, output_json: bool = False):
             if r.status == "FAIL":
                 print(f"    - [{r.section}] {r.name}: {r.detail}")
 
-    if output_json:
-        json_path = _PROJECT_ROOT / "validation_report.json"
-        with open(json_path, "w") as f:
-            f.write(t.to_json())
-        print(f"\n  JSON report saved to: {json_path}")
+    # ── JSON output ───────────────────────────────────────────────────
+    if print_json:
+        print("\n" + t.to_json())
+
+    if json_out_path:
+        try:
+            safe_path = _validate_json_out_path(json_out_path)
+            with open(safe_path, "w") as f:
+                f.write(t.to_json())
+            print(f"\n  JSON report saved to: {safe_path}")
+        except ValueError as e:
+            print(f"\n  [ERROR] Cannot write JSON: {e}")
 
     return score
 
@@ -641,7 +721,9 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Skip heavy model/dataset checks")
     parser.add_argument("--full", action="store_true", help="Run all checks including slow ones")
     parser.add_argument("--run-smoke", action="store_true", help="Also run local smoke tests as subprocesses")
-    parser.add_argument("--json", action="store_true", help="Output JSON summary to validation_report.json")
+    parser.add_argument("--json", action="store_true", help="Print JSON summary to stdout (read-only)")
+    parser.add_argument("--json-out", type=str, default=None, metavar="PATH",
+                        help="Write JSON report to a specific file (explicit write)")
     args = parser.parse_args()
 
     quick = args.quick and not args.full
@@ -663,7 +745,7 @@ def main():
     validate_models(t, quick=quick)
     validate_smoke_tests(t, run_smoke=args.run_smoke)
 
-    score = print_summary(t, output_json=args.json)
+    score = print_summary(t, print_json=args.json, json_out_path=args.json_out)
 
     sys.exit(0 if score >= 80 else 1)
 
