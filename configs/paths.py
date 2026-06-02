@@ -40,6 +40,7 @@
 # CELL 1 -- Imports (Minimal, Zero ML Dependencies)
 # =============================================================================
 
+import os
 import sys
 import logging
 from pathlib import Path
@@ -52,19 +53,30 @@ logger = logging.getLogger(__name__)
 # CELL 2 -- Environment Detection (Auto-Detect Colab vs Local)
 # =============================================================================
 #
-# Priority order:
-#   1. Colab mounted Drive path   -- checked first (most constrained env)
-#   2. Local development path     -- fallback for Windows/Linux dev machines
-#
-# The system auto-detects the environment at import time.
-# NO manual toggle, NO environment variable required.
+# Resolution priority:
+#   1. Environment variable MULTI_MODEL_AI_ROOT if set and exists
+#   2. Colab Drive mount: /content/drive/MyDrive/multi-model-ai
+#   3. Colab runtime root: /content/multi-model-ai
+#   4. Local Windows root: D:/multi-model-ai
+#   5. Current-file-derived fallback if it contains project markers
+#   6. Else raise clear FileNotFoundError
 #
 # To relocate the project:
-#   - Update ONLY _COLAB_ROOT or _LOCAL_ROOT below
+#   - Set MULTI_MODEL_AI_ROOT environment variable, OR
+#   - Update _COLAB_ROOT or _LOCAL_ROOT below
 #   - Every downstream import automatically picks up the change
 
 _COLAB_ROOT = Path("/content/drive/MyDrive/multi-model-ai")
+_COLAB_RUNTIME_ROOT = Path("/content/multi-model-ai")
 _LOCAL_ROOT = Path("D:/multi-model-ai")
+
+# Expected project structure markers for fallback validation
+_PROJECT_MARKERS = ("configs", "data_pipeline", "models", "preprocessed-datasets")
+
+
+def _has_project_markers(candidate: Path) -> bool:
+    """Check if a candidate directory has expected project structure."""
+    return all((candidate / m).exists() for m in _PROJECT_MARKERS)
 
 
 def _resolve_project_root() -> Path:
@@ -72,33 +84,71 @@ def _resolve_project_root() -> Path:
     Determines the project root based on environment detection.
 
     Resolution order:
-      1. Colab Drive mount exists -> use Colab root
-      2. Local dev root exists   -> use local root
-      3. Neither exists          -> raise immediately with debugging guidance
+      1. MULTI_MODEL_AI_ROOT env var (resolved, expanded, normalized)
+      2. Colab Drive mount:   /content/drive/MyDrive/multi-model-ai
+      3. Colab runtime root:  /content/multi-model-ai
+      4. Local Windows root:  D:/multi-model-ai
+      5. File-derived root if it contains project markers
+      6. Else raise with debugging guidance
 
     Returns:
         Path : Verified, absolute project root directory.
 
     Raises:
-        FileNotFoundError : If neither Colab nor local root directories exist.
+        FileNotFoundError : If no valid project root is found.
     """
+    checked = []
+
+    # 1. Environment variable override
+    env_root_str = os.environ.get("MULTI_MODEL_AI_ROOT")
+    if env_root_str:
+        env_root = Path(env_root_str).expanduser().resolve()
+        checked.append(("MULTI_MODEL_AI_ROOT", env_root))
+        if env_root.exists() and _has_project_markers(env_root):
+            logger.info(f"Environment detected: ENV_VAR | root={env_root}")
+            return env_root
+        elif env_root.exists():
+            logger.warning(
+                f"MULTI_MODEL_AI_ROOT={env_root} exists but missing project markers: "
+                f"{[m for m in _PROJECT_MARKERS if not (env_root / m).exists()]}"
+            )
+
+    # 2. Colab Drive mount
+    checked.append(("Colab Drive", _COLAB_ROOT))
     if _COLAB_ROOT.exists():
         logger.info(f"Environment detected: COLAB | root={_COLAB_ROOT}")
         return _COLAB_ROOT
 
+    # 3. Colab runtime root
+    checked.append(("Colab runtime", _COLAB_RUNTIME_ROOT))
+    if _COLAB_RUNTIME_ROOT.exists():
+        logger.info(f"Environment detected: COLAB_RUNTIME | root={_COLAB_RUNTIME_ROOT}")
+        return _COLAB_RUNTIME_ROOT
+
+    # 4. Local Windows root
+    checked.append(("Local", _LOCAL_ROOT))
     if _LOCAL_ROOT.exists():
         logger.info(f"Environment detected: LOCAL | root={_LOCAL_ROOT}")
         return _LOCAL_ROOT
 
+    # 5. File-derived fallback (configs/paths.py -> PROJECT_ROOT)
+    derived = Path(__file__).resolve().parent.parent
+    checked.append(("File-derived", derived))
+    if derived.exists() and _has_project_markers(derived):
+        logger.info(f"Environment detected: FILE_DERIVED | root={derived}")
+        return derived
+
+    # 6. Failure with full diagnostics
+    details = "\n".join(f"    {name:20s}: {p} (exists={p.exists()})" for name, p in checked)
     raise FileNotFoundError(
         f"PROJECT ROOT NOT FOUND.\n"
-        f"  Checked Colab : {_COLAB_ROOT}\n"
-        f"  Checked Local : {_LOCAL_ROOT}\n"
-        f"\n"
+        f"  Checked locations:\n{details}\n\n"
+        f"  Expected project markers: {_PROJECT_MARKERS}\n\n"
         f"  Resolution:\n"
-        f"    Colab: Mount Google Drive first -> drive.mount('/content/drive')\n"
-        f"    Local: Verify the project directory exists at {_LOCAL_ROOT}\n"
-        f"    Custom: Update _COLAB_ROOT or _LOCAL_ROOT in configs/paths.py"
+        f"    Option 1: Set MULTI_MODEL_AI_ROOT environment variable\n"
+        f"    Option 2 (Colab): Mount Drive -> drive.mount('/content/drive')\n"
+        f"    Option 3 (Local): Verify project exists at {_LOCAL_ROOT}\n"
+        f"    Option 4: Update _COLAB_ROOT or _LOCAL_ROOT in configs/paths.py"
     )
 
 
@@ -346,6 +396,35 @@ def get_experiment_dir(experiment_name: str) -> Path:
     return exp_dir
 
 
+def _ensure_child_path(base: Path, candidate: Path, context: str) -> Path:
+    """
+    Validate that *candidate* resolves to a location inside *base*.
+
+    Prevents path-traversal attacks (e.g., '../../escape.csv').
+
+    Args:
+        base      : The trusted parent directory.
+        candidate : The candidate path to validate.
+        context   : Human-readable label for error messages.
+
+    Returns:
+        Path : The resolved, validated candidate path.
+
+    Raises:
+        ValueError : If the candidate resolves outside the base.
+    """
+    base_resolved = base.resolve()
+    candidate_resolved = candidate.resolve()
+    if candidate_resolved != base_resolved and base_resolved not in candidate_resolved.parents:
+        raise ValueError(
+            f"PATH TRAVERSAL BLOCKED ({context}).\n"
+            f"  Base       : {base_resolved}\n"
+            f"  Candidate  : {candidate_resolved}\n"
+            f"  Resolution : Use a simple filename without '..' or absolute paths."
+        )
+    return candidate_resolved
+
+
 def get_dataset_csv(filename: str) -> Path:
     """
     Returns the full path for a preprocessed CSV dataset file.
@@ -359,11 +438,16 @@ def get_dataset_csv(filename: str) -> Path:
 
     Raises:
         FileNotFoundError : If the CSV file does not exist.
+        ValueError         : If the path escapes PREPROCESSED_DATASET_DIR.
     """
     if not filename:
         raise ValueError("Dataset CSV filename cannot be empty.")
 
-    csv_path = PREPROCESSED_DATASET_DIR / filename
+    csv_path = _ensure_child_path(
+        PREPROCESSED_DATASET_DIR,
+        PREPROCESSED_DATASET_DIR / filename,
+        "get_dataset_csv",
+    )
 
     if not csv_path.exists():
         # List available CSVs for debugging
@@ -375,6 +459,84 @@ def get_dataset_csv(filename: str) -> Path:
         )
 
     return csv_path
+
+
+def list_preprocessed_csvs() -> list:
+    """
+    Discover all CSV files in PREPROCESSED_DATASET_DIR.
+
+    Returns:
+        List[Path] : Sorted list of absolute paths to each .csv file.
+                     Returns empty list if directory does not exist.
+    """
+    if not PREPROCESSED_DATASET_DIR.exists():
+        return []
+    return sorted(PREPROCESSED_DATASET_DIR.glob("*.csv"))
+
+
+def resolve_preprocessed_csv(filename: str) -> Path:
+    """
+    Resolve a preprocessed CSV filename to an absolute path.
+
+    Functionally equivalent to get_dataset_csv() but with a cleaner name
+    for registry/dataset routing use. get_dataset_csv() remains for
+    backward compatibility.
+
+    Args:
+        filename : CSV filename (e.g., 'sample_100.csv').
+
+    Returns:
+        Path : Absolute path inside PREPROCESSED_DATASET_DIR.
+
+    Raises:
+        FileNotFoundError : If the CSV file does not exist.
+        ValueError         : If the path escapes PREPROCESSED_DATASET_DIR.
+    """
+    return get_dataset_csv(filename)
+
+
+def resolve_image_file(filename_or_asin: str) -> Path:
+    """
+    Resolve an image filename or bare ASIN to an absolute path inside
+    IMAGE_DATASET_DIR.
+
+    Normalization rules:
+      - 'B001.jpg'    -> IMAGE_DATASET_DIR / 'B001.jpg'
+      - 'B001'        -> IMAGE_DATASET_DIR / 'B001.jpg'
+      - 'B001.png'    -> IMAGE_DATASET_DIR / 'B001.png' (preserves extension)
+      - '../escape'   -> ValueError (traversal blocked)
+      - './B001.jpg'   -> IMAGE_DATASET_DIR / 'B001.jpg' (if resolves safely)
+      - 'sub/B001.jpg' -> IMAGE_DATASET_DIR / 'sub/B001.jpg' (if under base)
+
+    This does NOT validate that the file exists.  Existence checking
+    belongs to the caller (dataset.py) so fallback behavior stays local.
+
+    Args:
+        filename_or_asin : Image filename or bare ASIN string.
+
+    Returns:
+        Path : Absolute path inside IMAGE_DATASET_DIR.
+
+    Raises:
+        ValueError : If the resolved path escapes IMAGE_DATASET_DIR.
+    """
+    if not filename_or_asin or not isinstance(filename_or_asin, str):
+        raise ValueError(
+            f"resolve_image_file requires a non-empty string, "
+            f"got {filename_or_asin!r}"
+        )
+    name = filename_or_asin.strip()
+    if not name:
+        raise ValueError("resolve_image_file: filename/ASIN is empty after stripping.")
+    # If no extension, assume .jpg (the standard image format for this pipeline)
+    if "." not in name:
+        name = f"{name}.jpg"
+    return _ensure_child_path(
+        IMAGE_DATASET_DIR,
+        IMAGE_DATASET_DIR / name,
+        "resolve_image_file",
+    )
+
 
 
 # %%
@@ -485,6 +647,60 @@ if __name__ == "__main__":
             print("    -> ERROR: Should have raised ValueError")
         except ValueError:
             print("    -> Empty CSV filename caught  PASS")
+
+        # -- New helper utilities ------------------------------------------
+        print("\n  Testing list_preprocessed_csvs()...")
+        csvs = list_preprocessed_csvs()
+        print(f"    -> Found {len(csvs)} CSVs")
+        if csvs:
+            print(f"    -> First: {csvs[0].name}")
+            all_paths_obj = all(isinstance(p, Path) for p in csvs)
+            print(f"    -> All are Path: {all_paths_obj}  {'PASS' if all_paths_obj else 'FAIL'}")
+
+        print("  Testing resolve_preprocessed_csv()...")
+        try:
+            rp = resolve_preprocessed_csv("sample_100.csv")
+            print(f"    -> {rp}  FOUND")
+        except FileNotFoundError:
+            print(f"    -> Expected: file may not exist locally")
+
+        print("  Testing resolve_image_file()...")
+        img_p = resolve_image_file("B001")
+        print(f"    -> B001 -> {img_p}")
+        assert img_p == IMAGE_DATASET_DIR / "B001.jpg", f"Expected .jpg, got {img_p}"
+        img_p2 = resolve_image_file("B001.png")
+        print(f"    -> B001.png -> {img_p2}")
+        assert img_p2 == IMAGE_DATASET_DIR / "B001.png"
+        try:
+            resolve_image_file("")
+            print("    -> ERROR: Should have raised ValueError")
+        except ValueError:
+            print("    -> Empty input caught  PASS")
+        print("    -> resolve_image_file  PASS")
+
+        # -- Traversal guard tests -----------------------------------------
+        print("\n  Testing traversal guards...")
+        try:
+            resolve_image_file("../escape.jpg")
+            print("    -> ERROR: ../escape.jpg should have raised ValueError")
+        except ValueError:
+            print("    -> ../escape.jpg traversal blocked  PASS")
+
+        try:
+            get_dataset_csv("../escape.csv")
+            print("    -> ERROR: ../escape.csv should have raised ValueError")
+        except (ValueError, FileNotFoundError):
+            print("    -> ../escape.csv traversal blocked  PASS")
+
+        try:
+            resolve_preprocessed_csv("../../etc/passwd")
+            print("    -> ERROR: traversal should have raised")
+        except (ValueError, FileNotFoundError):
+            print("    -> ../../etc/passwd blocked  PASS")
+
+        # Safe relative should work
+        safe = resolve_image_file("./B001.jpg")
+        print(f"    -> ./B001.jpg -> {safe.name}  PASS")
 
         # -- Idempotency: re-run runtime dir creation ----------------------
         print("\n  Testing idempotency (re-run _ensure_runtime_dirs)...")

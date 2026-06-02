@@ -44,7 +44,7 @@ import time
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------
 # Project Routing
@@ -58,6 +58,7 @@ try:
     from configs.paths import (
         IMAGE_DATASET_DIR,
         get_dataset_csv,
+        resolve_image_file,
     )
 except ImportError as _err:
     raise RuntimeError(
@@ -127,9 +128,21 @@ def _dataset_error(
 
 @dataclass
 class DatasetConfig:
-    """Configuration for MultimodalProductDataset."""
+    """
+    Configuration for MultimodalProductDataset.
 
+    Routing priority:
+      1. source_files  -> multi-source dataset (concatenated CSVs)
+      2. dataset_name  -> logical registry lookup
+      3. csv_filename  -> direct raw CSV override (default)
+    """
+
+    # -- Source routing (priority order) --
     csv_filename: str = "sample_100.csv"
+    dataset_name: Optional[str] = None
+    source_files: Optional[Sequence[str]] = None
+
+    # -- Dataset behavior --
     mode: str = "train"
     text_max_length: int = 64
     image_strict: bool = False
@@ -144,9 +157,36 @@ class DatasetConfig:
     asin_column: str = "asin"
 
     def __post_init__(self):
-        # -- csv_filename --
+        # -- csv_filename: strip and validate --
         if not isinstance(self.csv_filename, str) or not self.csv_filename.strip():
             raise ValueError(f"csv_filename must be non-empty str, got {self.csv_filename!r}")
+        self.csv_filename = self.csv_filename.strip()
+        # -- dataset_name: strip and validate --
+        if self.dataset_name is not None:
+            if not isinstance(self.dataset_name, str) or not self.dataset_name.strip():
+                raise ValueError(f"dataset_name must be non-empty str or None, got {self.dataset_name!r}")
+            self.dataset_name = self.dataset_name.strip()
+        # -- source_files: consume iterables, normalize to tuple, strip, reject dupes --
+        if self.source_files is not None:
+            if not hasattr(self.source_files, '__iter__') or isinstance(self.source_files, str):
+                raise TypeError(f"source_files must be a sequence of str or None, got {type(self.source_files).__name__}")
+            sf_list = list(self.source_files)  # safely consumes generators
+            if len(sf_list) == 0:
+                raise ValueError("source_files must be non-empty if provided.")
+            for i, sf in enumerate(sf_list):
+                if not isinstance(sf, str) or not sf.strip():
+                    raise ValueError(f"source_files[{i}] must be non-empty str, got {sf!r}")
+            sf_normalized = tuple(sf.strip() for sf in sf_list)
+            # Reject duplicate filenames early
+            seen = set()
+            for sf in sf_normalized:
+                if sf in seen:
+                    raise ValueError(
+                        f"source_files contains duplicate filenames: {sf}. "
+                        f"Each source must be unique."
+                    )
+                seen.add(sf)
+            self.source_files = sf_normalized
         # -- mode --
         if not isinstance(self.mode, str):
             raise TypeError(f"mode must be str, got {type(self.mode).__name__}: {self.mode!r}")
@@ -181,7 +221,7 @@ class DatasetConfig:
 # =============================================================================
 
 def resolve_image_path(
-    row, asin: str, image_path_column: str
+    row, asin: str, image_path_column: str, has_image_path_column: bool = True
 ) -> Tuple[str, bool, str]:
     """
     Resolve image path from row.
@@ -190,10 +230,21 @@ def resolve_image_path(
         (resolved_path_str, used_fallback, reason)
 
     Path routing:
-      - If raw path is absolute and non-empty -> use as-is.
-      - If raw path is relative and non-empty -> resolve via IMAGE_DATASET_DIR.
-      - If raw path is missing/empty/NaN      -> fallback to IMAGE_DATASET_DIR/{asin}.jpg.
+      - If image_path column is missing entirely -> ASIN fallback.
+      - If raw path is absolute and inside IMAGE_DATASET_DIR -> use as-is.
+      - If raw path is relative and non-empty -> resolve via resolve_image_file (safe).
+      - If raw path is missing/empty/NaN -> fallback to IMAGE_DATASET_DIR/{asin}.jpg.
     """
+    # If column doesn't exist, go straight to ASIN fallback
+    if not has_image_path_column:
+        if not asin or not str(asin).strip():
+            raise ValueError(
+                f"[DATASET ERROR] Cannot construct fallback image path: "
+                f"ASIN is empty/missing. image_path_column='{image_path_column}'"
+            )
+        fallback = str(resolve_image_file(asin))
+        return fallback, True, "image_path_column_missing_asin_fallback"
+
     raw = row.get(image_path_column) if isinstance(row, dict) else getattr(row, image_path_column, None)
 
     # -- Check for usable string path --
@@ -201,22 +252,40 @@ def resolve_image_path(
         cleaned = raw.strip()
         p = Path(cleaned)
         if p.is_absolute():
-            return str(p.resolve()), False, "absolute_path"
-        # Relative path -> route through IMAGE_DATASET_DIR
-        return str((IMAGE_DATASET_DIR / cleaned).resolve()), False, "relative_resolved"
+            # Absolute paths: verify inside IMAGE_DATASET_DIR
+            resolved = p.resolve()
+            img_base = IMAGE_DATASET_DIR.resolve()
+            if resolved == img_base or img_base in resolved.parents:
+                return str(resolved), False, "absolute_path"
+            # Absolute outside IMAGE_DATASET_DIR: reject
+            raise ValueError(
+                f"[DATASET ERROR] Absolute image path outside IMAGE_DATASET_DIR.\n"
+                f"  Path : {resolved}\n"
+                f"  Base : {img_base}\n"
+                f"  Resolution: Use relative paths or move images into IMAGE_DATASET_DIR."
+            )
+        # Relative path -> resolve via resolve_image_file (traversal-safe)
+        try:
+            resolved = resolve_image_file(cleaned)
+            return str(resolved), False, "relative_resolved"
+        except ValueError:
+            # Traversal or bad path -> fall back to ASIN
+            fallback = str(resolve_image_file(asin))
+            return fallback, True, "relative_path_unsafe_asin_fallback"
 
     # -- Check for NaN float (pandas missing) --
     if raw is not None:
         try:
             if isinstance(raw, float) and math.isnan(raw):
-                pass  # fall through
+                pass  # fall through to ASIN fallback
             else:
                 s = str(raw).strip()
                 if s:
-                    p = Path(s)
-                    if p.is_absolute():
-                        return str(p.resolve()), False, "absolute_path"
-                    return str((IMAGE_DATASET_DIR / s).resolve()), False, "relative_resolved"
+                    try:
+                        resolved = resolve_image_file(s)
+                        return str(resolved), False, "relative_resolved"
+                    except ValueError:
+                        pass  # traversal blocked -> ASIN fallback
         except (TypeError, ValueError):
             pass
 
@@ -226,7 +295,7 @@ def resolve_image_path(
             f"[DATASET ERROR] Cannot construct fallback image path: "
             f"ASIN is empty/missing. image_path_column='{image_path_column}'"
         )
-    fallback = str((IMAGE_DATASET_DIR / f"{asin}.jpg").resolve())
+    fallback = str(resolve_image_file(asin))
     return fallback, True, "asin_fallback"
 
 
@@ -284,10 +353,87 @@ class MultimodalProductDataset(_torch_data.Dataset):
         self.config = config
         self._torch = torch
 
-        # -- Load CSV ----------------------------------------------------------
-        csv_path = get_dataset_csv(config.csv_filename)
-        logger.info(f"Loading CSV: {csv_path}")
-        self.df = pd.read_csv(csv_path)
+        # -- Route CSV source --------------------------------------------------
+        # Priority: source_files > dataset_name > csv_filename
+        self._source_files: List[str] = []  # tracks source per-row for metadata
+
+        if config.source_files is not None:
+            # Multi-source: load each, concatenate, validate ASIN uniqueness
+            frames: List[pd.DataFrame] = []
+            for fname in config.source_files:
+                csv_path = get_dataset_csv(fname)
+                logger.info(f"Loading source CSV: {csv_path}")
+                frame = pd.read_csv(csv_path)
+                frame["_source_file"] = fname
+                frame["_source_index"] = len(frames)
+                frames.append(frame)
+            # Current in-memory concat is intentional for current scale (6k-100k rows).
+            # Future large-scale option: lazy indexing / ConcatDataset / parquet shards.
+            # Do not write physical combined CSVs — multi-source stays in-memory only.
+            self.df = pd.concat(frames, ignore_index=True)
+            self._source_files = list(config.source_files)
+            logger.info(
+                f"Multi-source loaded | sources={len(frames)} | "
+                f"total_rows={len(self.df)}"
+            )
+            # Cross-source ASIN uniqueness
+            asin_col = self.df[config.asin_column]
+            dup_mask = asin_col.duplicated(keep=False)
+            dup_count = dup_mask.sum()
+            if dup_count > 0:
+                examples = asin_col[dup_mask].head(5).tolist()
+                raise ValueError(
+                    f"[DATASET ERROR] {dup_count} duplicate ASINs across "
+                    f"{len(frames)} sources. Examples: {examples}. "
+                    f"Multi-source datasets require globally unique ASINs. "
+                    f"Resolution: deduplicate CSVs or use separate DatasetConfig objects."
+                )
+        elif config.dataset_name is not None:
+            # Registry lookup: check groups first, then single-file
+            from data_pipeline.dataset_registry import (
+                resolve_dataset, resolve_dataset_group, REGISTERED_DATASETS,
+            )
+            if config.dataset_name in REGISTERED_DATASETS:
+                # Group resolution -> multi-source
+                group_files = resolve_dataset_group(config.dataset_name)
+                logger.info(
+                    f"Group '{config.dataset_name}' resolved to {len(group_files)} sources: {group_files}"
+                )
+                frames_g: List[pd.DataFrame] = []
+                for gf in group_files:
+                    gcsv = get_dataset_csv(gf)
+                    gframe = pd.read_csv(gcsv)
+                    gframe["_source_file"] = gf
+                    gframe["_source_index"] = len(frames_g)
+                    frames_g.append(gframe)
+                self.df = pd.concat(frames_g, ignore_index=True)
+                self._source_files = list(group_files)
+                # Cross-source ASIN uniqueness (same check as source_files)
+                asin_col_g = self.df[config.asin_column]
+                dup_mask_g = asin_col_g.duplicated(keep=False)
+                dup_count_g = dup_mask_g.sum()
+                if dup_count_g > 0:
+                    examples_g = asin_col_g[dup_mask_g].head(5).tolist()
+                    raise ValueError(
+                        f"[DATASET ERROR] {dup_count_g} duplicate ASINs across group "
+                        f"'{config.dataset_name}' ({len(frames_g)} sources). "
+                        f"Examples: {examples_g}. "
+                        f"Resolution: deduplicate CSVs or use non-overlapping sources."
+                    )
+            else:
+                # Single-file logical lookup
+                desc = resolve_dataset(dataset_name=config.dataset_name)
+                csv_path = Path(desc.csv_path)
+                logger.info(f"Registry resolved: {config.dataset_name} -> {csv_path}")
+                self.df = pd.read_csv(csv_path)
+                self._source_files = [desc.filename]
+        else:
+            # Direct CSV override (original behavior)
+            csv_path = get_dataset_csv(config.csv_filename)
+            logger.info(f"Loading CSV: {csv_path}")
+            self.df = pd.read_csv(csv_path)
+            self._source_files = [config.csv_filename]
+
         self._num_rows = len(self.df)
         logger.info(f"CSV loaded | rows={self._num_rows} | columns={list(self.df.columns)}")
 
@@ -551,7 +697,8 @@ class MultimodalProductDataset(_torch_data.Dataset):
         # == IMAGE =============================================================
         t0 = _now_ms() if do_timing else None
         img_path, img_fallback, resolve_reason = resolve_image_path(
-            row, asin, cfg.image_path_column
+            row, asin, cfg.image_path_column,
+            has_image_path_column=(cfg.image_path_column in self.df.columns),
         )
         t_resolve = (_now_ms() - t0) if t0 else None
         trace.append(self._trace_event(
@@ -723,7 +870,13 @@ class MultimodalProductDataset(_torch_data.Dataset):
             "tokenization_ms": t_tok,
             "tabular_ms": t_tab,
             "total_sample_ms": total_ms,
+            "image_exists": Path(img_path).exists(),
+            "image_resolution_reason": resolve_reason,
         }
+        # Multi-source metadata (lightweight strings/ints only)
+        if "_source_file" in row.index if hasattr(row, 'index') else "_source_file" in row:
+            metadata["source_file"] = str(row["_source_file"])
+            metadata["source_index"] = int(row["_source_index"])
         if do_trace:
             metadata["trace"] = trace
 
@@ -885,6 +1038,46 @@ if __name__ == "__main__":
             chk("non-bool strict rejected", True)
 
         chk("strict_tabular default False", DatasetConfig().strict_tabular is False)
+        chk("dataset_name default None", DatasetConfig().dataset_name is None)
+        chk("source_files default None", DatasetConfig().source_files is None)
+
+        try:
+            DatasetConfig(dataset_name="")
+            chk("empty dataset_name rejected", False)
+        except ValueError:
+            chk("empty dataset_name rejected", True)
+
+        try:
+            DatasetConfig(source_files="bad")
+            chk("string source_files rejected", False)
+        except TypeError:
+            chk("string source_files rejected", True)
+
+        try:
+            DatasetConfig(source_files=[])
+            chk("empty source_files rejected", False)
+        except ValueError:
+            chk("empty source_files rejected", True)
+
+        chk("list source_files ok", DatasetConfig(source_files=["a.csv"]).source_files is not None)
+        chk("tuple source_files ok", DatasetConfig(source_files=("a.csv",)).source_files is not None)
+
+        # Normalization tests
+        chk("csv_filename stripped", DatasetConfig(csv_filename=" sample_100.csv ").csv_filename == "sample_100.csv")
+        chk("dataset_name stripped", DatasetConfig(dataset_name=" sample_100 ").dataset_name == "sample_100")
+
+        # Generator consumption test
+        gen_cfg = DatasetConfig(source_files=(x for x in ["a.csv", "b.csv"]))
+        chk("generator -> tuple", isinstance(gen_cfg.source_files, tuple))
+        chk("generator length 2", len(gen_cfg.source_files) == 2)
+        chk("source_files stripped", DatasetConfig(source_files=[" a.csv "]).source_files == ("a.csv",))
+
+        # Duplicate rejection
+        try:
+            DatasetConfig(source_files=["a.csv", "a.csv"])
+            chk("duplicate source_files rejected", False)
+        except ValueError:
+            chk("duplicate source_files rejected", True)
 
         # -- 2. Build temp CSV for testing ---------------------------------
         print("\n  2. Temporary CSV dataset...")
@@ -908,6 +1101,7 @@ if __name__ == "__main__":
         pd.DataFrame({"wrong_col": [1]}).to_csv(bad_csv, index=False)
 
         _orig_get = _ds_mod.get_dataset_csv
+        _orig_get_local = globals().get("get_dataset_csv")
         def _mock_get(fn):
             lookup = {
                 "test_smoke.csv": tmp_csv,
@@ -917,6 +1111,7 @@ if __name__ == "__main__":
                 return Path(lookup[fn])
             return _orig_get(fn)
         _ds_mod.get_dataset_csv = _mock_get
+        globals()["get_dataset_csv"] = _mock_get
 
         try:
             MultimodalProductDataset(DatasetConfig(csv_filename="bad_schema.csv"))
@@ -938,6 +1133,7 @@ if __name__ == "__main__":
                 return Path(asin_csv)
             return _mock_get(fn)
         _ds_mod.get_dataset_csv = _mock_get2
+        globals()["get_dataset_csv"] = _mock_get2
 
         try:
             MultimodalProductDataset(DatasetConfig(csv_filename="bad_asin.csv"))
@@ -945,7 +1141,8 @@ if __name__ == "__main__":
         except ValueError as e:
             chk("empty ASIN rejected", "invalid ASIN" in str(e) or "SCHEMA ERROR" in str(e))
 
-        _ds_mod.get_dataset_csv = _mock_get  # restore
+        _ds_mod.get_dataset_csv = _mock_get  # restore to mock_get
+        globals()["get_dataset_csv"] = _mock_get
 
         # -- 4. Build dataset from temp CSV --------------------------------
         print("\n  4. Dataset construction...")
@@ -973,6 +1170,10 @@ if __name__ == "__main__":
         chk("trace present", "trace" in sample["metadata"])
         chk("asin correct", sample["asin"] == "B001")
         chk("tokenizer loaded after sample", ds._tokenizer is not None)
+        chk("image_exists in metadata", "image_exists" in sample["metadata"])
+        chk("image_resolution_reason", "image_resolution_reason" in sample["metadata"])
+        chk("image_exists is bool", isinstance(sample["metadata"]["image_exists"], bool))
+        chk("resolution_reason is str", isinstance(sample["metadata"]["image_resolution_reason"], str))
 
         # -- 6. Index validation -------------------------------------------
         print("\n  6. Index validation...")
@@ -1059,6 +1260,11 @@ if __name__ == "__main__":
         if _orig_get is not None and _ds_mod_ref is not None:
             try:
                 _ds_mod_ref.get_dataset_csv = _orig_get
+            except Exception:
+                pass
+        if _orig_get is not None:
+            try:
+                globals()["get_dataset_csv"] = _orig_get
             except Exception:
                 pass
         # Clean temp files even on failure
