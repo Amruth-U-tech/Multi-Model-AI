@@ -66,11 +66,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 # ---------------------------------------------------------------
-# Google Colab + Project Import Safety
+# Project Import Routing (local + Colab compatible)
 # ---------------------------------------------------------------
-PROJECT_PATH = Path("/content/drive/MyDrive/multi-model-ai")
-if str(PROJECT_PATH) not in sys.path:
-    sys.path.append(str(PROJECT_PATH))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
 import torch.nn as nn

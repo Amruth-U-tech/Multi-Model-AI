@@ -45,17 +45,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ─────────────────────────────────────────────────────────────
-# Google Colab + Project Import Safety
+# Project Import Routing (local + Colab compatible)
 # ─────────────────────────────────────────────────────────────
-# Ensures `from models.tabular_encoder import ...` works reliably
-# across Colab notebooks, train.py, inference.py, and experimentation
-# pipelines when the project is mounted via Google Drive.
-#
-# This is PROJECT IMPORT ROUTING only — no dataset paths, no checkpoint
-# paths, no preprocessing paths. Encoders must remain PATH-AGNOSTIC.
-PROJECT_PATH = Path("/content/drive/MyDrive/multi-model-ai")
-if str(PROJECT_PATH) not in sys.path:
-    sys.path.append(str(PROJECT_PATH))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 # ─────────────────────────────────────────────────────────────
 # Logging Configuration
@@ -347,16 +341,16 @@ if __name__ == "__main__":
             emb = encoder(dummy)
 
         assert emb.shape == (4, 512), f"Shape mismatch: {emb.shape}"
-        logger.info(f"Output shape     : {tuple(emb.shape)}  ✅")
+        logger.info(f"Output shape     : {tuple(emb.shape)}  [PASS]")
 
         # ── L2 norm verification ──────────────────────────────────────────────────
         norms = emb.norm(dim=1)
         assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), "L2 norm failed"
-        logger.info(f"Norms (≈ 1.0)    : {[round(n, 4) for n in norms.tolist()]}  ✅")
+        logger.info(f"Norms (≈ 1.0)    : {[round(n, 4) for n in norms.tolist()]}  [PASS]")
 
         # ── Interface symmetry ────────────────────────────────────────────────────
         assert encoder.get_embedding_dim() == 512
-        logger.info(f"get_embedding_dim: {encoder.get_embedding_dim()}  ✅")
+        logger.info(f"get_embedding_dim: {encoder.get_embedding_dim()}  [PASS]")
 
         # ── NaN sanitization ──────────────────────────────────────────────────────
         logger.info("Testing NaN sanitization...")
@@ -365,7 +359,7 @@ if __name__ == "__main__":
         with torch.no_grad():
             nan_emb = encoder(nan_input)
         assert torch.isfinite(nan_emb).all(), "NaN propagated through encoder"
-        logger.info("NaN sanitization : PASSED  ✅")
+        logger.info("NaN sanitization : PASSED  [PASS]")
 
         # ── Rank guard ────────────────────────────────────────────────────────────
         logger.info("Testing rank guard...")
@@ -373,7 +367,7 @@ if __name__ == "__main__":
             encoder(torch.randn(4, test_input_dim, 1).to(device))
             assert False, "Should have raised ValueError"
         except ValueError as e:
-            logger.info(f"Rank guard       : caught → {e}  ✅")
+            logger.info(f"Rank guard       : caught → {e}  [PASS]")
 
         # ── Empty batch guard ─────────────────────────────────────────────────────
         logger.info("Testing empty batch guard...")
@@ -381,7 +375,7 @@ if __name__ == "__main__":
             encoder(torch.randn(0, test_input_dim).to(device))
             assert False, "Should have raised ValueError"
         except ValueError as e:
-            logger.info(f"Batch guard      : caught → {e}  ✅")
+            logger.info(f"Batch guard      : caught → {e}  [PASS]")
 
         # ── Dimension guard ───────────────────────────────────────────────────────
         logger.info("Testing dimension guard...")
@@ -389,15 +383,15 @@ if __name__ == "__main__":
             encoder(torch.randn(4, test_input_dim + 3).to(device))
             assert False, "Should have raised ValueError"
         except ValueError as e:
-            logger.info(f"Dim guard        : caught → {e}  ✅")
+            logger.info(f"Dim guard        : caught → {e}  [PASS]")
 
         # ── Trainable parameter count ─────────────────────────────────────────────
         logger.info(f"Trainable params : {encoder._count_trainable_params():,}")
 
         logger.info("=" * 60)
-        logger.info("  ✅  Smoke test PASSED — TabularEncoder is infrastructure-grade stable.")
+        logger.info("  [PASS]  Smoke test PASSED -- TabularEncoder is infrastructure-grade stable.")
         logger.info("=" * 60)
 
     except Exception as e:
-        logger.exception(f"❌ SMOKE TEST FAILED: {e}")
+        logger.exception(f"[FAIL] SMOKE TEST FAILED: {e}")
         sys.exit(1)

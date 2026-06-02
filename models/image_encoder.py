@@ -49,11 +49,11 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 # ---------------------------------------------------------------
-# Google Colab + Project Import Safety
+# Project Import Routing (local + Colab compatible)
 # ---------------------------------------------------------------
-PROJECT_PATH = Path("/content/drive/MyDrive/multi-model-ai")
-if str(PROJECT_PATH) not in sys.path:
-    sys.path.append(str(PROJECT_PATH))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
 import torch.nn as nn
@@ -399,20 +399,54 @@ class ImageEncoder(nn.Module):
                          L2-normalized to unit sphere if config.normalize_embeddings=True.
 
         Raises:
-            ValueError : If input is not 4D or channels != 3.
+            TypeError  : If input is not a torch.Tensor.
+            ValueError : If input fails rank, batch, channel, dtype, or NaN checks.
         """
-        # -- Validate tensor dimensionality ------------------------------------
+        # -- Type check --------------------------------------------------------
+        if not isinstance(images, torch.Tensor):
+            raise TypeError(
+                f"ImageEncoder.forward() expected torch.Tensor, "
+                f"got {type(images).__name__}"
+            )
+
+        # -- Rank check (4D) ---------------------------------------------------
         if images.ndim != 4:
             raise ValueError(
                 f"ImageEncoder.forward() expected 4D tensor (B,C,H,W), "
-                f"got {tuple(images.shape)}"
+                f"got {images.ndim}D shape {tuple(images.shape)}"
             )
 
-        # -- Validate channel count --------------------------------------------
+        # -- Batch size > 0 ----------------------------------------------------
+        if images.shape[0] == 0:
+            raise ValueError("ImageEncoder.forward() received empty batch (B=0).")
+
+        # -- Channel count = 3 -------------------------------------------------
         if images.shape[1] != 3:
             raise ValueError(
                 f"ImageEncoder.forward() expected 3 channels (RGB), "
                 f"got {images.shape[1]}. Verify transforms.py preprocessing."
+            )
+
+        # -- Floating point dtype ----------------------------------------------
+        if not images.is_floating_point():
+            raise ValueError(
+                f"ImageEncoder.forward() expected floating point dtype, "
+                f"got {images.dtype}. Ensure transforms.py returns float tensors."
+            )
+
+        # -- NaN / Inf check ---------------------------------------------------
+        if not torch.isfinite(images).all():
+            raise ValueError(
+                "ImageEncoder.forward() received tensor with NaN or Inf values. "
+                "Verify transforms.py preprocessing and data pipeline integrity."
+            )
+
+        # -- Spatial contract (warn if not 224x224) ----------------------------
+        h, w = images.shape[2], images.shape[3]
+        if h != 224 or w != 224:
+            logger.warning(
+                f"ImageEncoder spatial contract: expected (224, 224), "
+                f"got ({h}, {w}). Model may produce unexpected results."
             )
 
         # -- ConvNeXt feature extraction -> (B, 768) ---------------------------
@@ -491,7 +525,9 @@ if __name__ == "__main__":
         logger.info(f"Device: {device}")
 
         # -- Config and encoder ------------------------------------------------
-        config  = ImageEncoderConfig(latent_dim=512, freeze_backbone=True)
+        # Smoke test uses pretrained=False to avoid network dependency.
+        # Production default remains pretrained=True (see ImageEncoderConfig).
+        config  = ImageEncoderConfig(latent_dim=512, freeze_backbone=True, pretrained=False)
         encoder = build_encoder(config)
         encoder.to(device)
         encoder.eval()

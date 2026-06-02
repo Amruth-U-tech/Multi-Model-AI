@@ -13,11 +13,11 @@ from pathlib import Path
 from typing import Optional, Dict, Tuple
 
 # ─────────────────────────────────────────────────────────────
-# Google Colab + Project Import Safety
+# Project Import Routing (local + Colab compatible)
 # ─────────────────────────────────────────────────────────────
-PROJECT_PATH = Path("/content/drive/MyDrive/multi-model-ai")
-if str(PROJECT_PATH) not in sys.path:
-    sys.path.append(str(PROJECT_PATH))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,20 @@ class FusionModel(nn.Module):
     def __init__(self, config: Optional[FusionConfig] = None):
         super().__init__()
         self.config = config or FusionConfig()
-        
+
+        # ── Dimension Equality Guard ───────────────────────────────────────
+        # Current weighted-sum fusion requires all modality vectors to have
+        # the same dimension. Future per-modality projection layers would
+        # remove this constraint.
+        cfg = self.config
+        if not (cfg.image_dim == cfg.text_dim == cfg.tabular_dim == cfg.fusion_dim):
+            raise ValueError(
+                f"[FUSION ERROR] Current weighted-sum architecture requires uniform dims.\n"
+                f"  image_dim={cfg.image_dim}, text_dim={cfg.text_dim}, "
+                f"tabular_dim={cfg.tabular_dim}, fusion_dim={cfg.fusion_dim}\n"
+                f"  Resolution: Ensure all dims are equal, or add per-modality projections."
+            )
+
         # 1. Modality Gating (Stable Adaptive Trust)
         self.modality_gate = nn.Sequential(
             nn.Linear(self.config.total_input_dim, self.config.hidden_dim),
@@ -198,25 +211,34 @@ if __name__ == "__main__":
     m_img, m_txt, m_tab = torch.randn(B, 512), torch.randn(B, 512), torch.randn(B, 512)
     
     try:
-        out = model(m_img, m_txt, m_tab)
+        with torch.no_grad():
+            out = model(m_img, m_txt, m_tab)
         assert torch.allclose(torch.norm(out["fused_embedding"], dim=1), torch.ones(B), atol=1e-5)
-        print("✅ Standard Inference: PASSED")
+        print("[PASS] Standard Inference")
 
         # Rank Validation Test
         print("Testing Rank Guard...")
         try:
-            model(torch.randn(B, 512, 1), m_txt, m_tab) # Invalid 3D Rank
+            model(torch.randn(B, 512, 1), m_txt, m_tab)
         except ValueError as e:
-            print(f"✅ Rank Guard caught error: {e}")
+            print(f"[PASS] Rank Guard caught error: {e}")
 
         # Batch Guard Test
         print("Testing Batch Guard...")
         try:
             model(torch.randn(B, 512), torch.randn(B-1, 512), m_tab)
         except ValueError as e:
-            print(f"✅ Batch Guard caught error: {e}")
+            print(f"[PASS] Batch Guard caught error: {e}")
+
+        # Dimension Contract Guard Test
+        print("Testing Dimension Contract Guard...")
+        try:
+            FusionModel(FusionConfig(image_dim=256, text_dim=512))
+            print("[FAIL] Should have raised ValueError")
+        except ValueError as e:
+            print(f"[PASS] Dim contract guard: {e}")
 
         print("\nRESULT: FUSION MODEL IS INFRASTRUCTURE-GRADE STABLE.")
     except Exception as e:
-        print(f"❌ SMOKE TEST FAILED: {e}")
+        print(f"[FAIL] SMOKE TEST FAILED: {e}")
         sys.exit(1)

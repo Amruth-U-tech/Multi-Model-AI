@@ -71,6 +71,15 @@ logger = logging.getLogger(__name__)
 # Falls back gracefully if configs.paths is not importable (e.g., when
 # running tokenization.py in complete isolation for unit testing).
 
+# Bootstrap: derive project root from this file's location so that
+# `from configs.paths import CACHE_DIR` succeeds even when running
+# this file directly (python data_pipeline/tokenization.py).
+# configs.paths then takes over as the canonical routing authority.
+_THIS_DIR = Path(__file__).resolve().parent          # data_pipeline/
+_PROJECT_DIR = _THIS_DIR.parent                      # multi-model-ai/
+if str(_PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_DIR))
+
 try:
     from configs.paths import CACHE_DIR, PROJECT_ROOT
     _HF_CACHE_DIR: Optional[Path] = CACHE_DIR / "huggingface"
@@ -568,12 +577,18 @@ if __name__ == "__main__":
             print("    -> Type guard PASS")
 
         # -- Error guards: invalid tokenizer name ------------------------------
-        print("  Testing invalid tokenizer name...")
-        try:
-            load_tokenizer("nonexistent/model-that-does-not-exist-xyz")
-            print("    -> ERROR: invalid model should raise RuntimeError")
-        except RuntimeError:
-            print("    -> Invalid model guard PASS")
+        # Gated behind RUN_NETWORK_NEGATIVE_TEST to avoid slow/noisy HuggingFace
+        # calls during offline or routine smoke runs.
+        import os
+        if os.environ.get("RUN_NETWORK_NEGATIVE_TEST", "").strip() == "1":
+            print("  Testing invalid tokenizer name (network test)...")
+            try:
+                load_tokenizer("nonexistent/model-that-does-not-exist-xyz")
+                print("    -> ERROR: invalid model should raise RuntimeError")
+            except RuntimeError:
+                print("    -> Invalid model guard PASS")
+        else:
+            print("  Skipping network negative test (set RUN_NETWORK_NEGATIVE_TEST=1 to run)")
 
         # -- Idempotency -------------------------------------------------------
         print("\n  Testing idempotency (reload tokenizer)...")
