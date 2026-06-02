@@ -127,6 +127,8 @@ class DatasetDescriptor:
     image_coverage_pct: float
     schema_valid: bool
     schema_missing: tuple
+    invalid_image_path_count: int = 0
+    invalid_image_path_examples: tuple = ()
     audit_ms: Optional[float] = None
 
     @property
@@ -187,6 +189,8 @@ def _audit_single_csv(csv_path: Path) -> DatasetDescriptor:
     images_found = 0
     images_missing = 0
     has_image_path = False
+    invalid_image_path_count = 0
+    invalid_image_path_examples: List[str] = []
 
     # Future scalability note:
     #   Current csv scan is fine for current 6k/20k/100k rows.
@@ -218,6 +222,12 @@ def _audit_single_csv(csv_path: Path) -> DatasetDescriptor:
                         try:
                             img_file = resolve_image_file(ip)
                         except ValueError:
+                            # Track invalid image path — do not crash discovery
+                            invalid_image_path_count += 1
+                            if len(invalid_image_path_examples) < 10:
+                                invalid_image_path_examples.append(
+                                    f"row={row_count}: {ip!r} (asin={asin_clean})"
+                                )
                             img_file = resolve_image_file(asin_clean)
                     else:
                         img_file = resolve_image_file(asin_clean)
@@ -263,6 +273,8 @@ def _audit_single_csv(csv_path: Path) -> DatasetDescriptor:
         image_coverage_pct=round(coverage_pct, 2),
         schema_valid=schema_valid,
         schema_missing=schema_missing,
+        invalid_image_path_count=invalid_image_path_count,
+        invalid_image_path_examples=tuple(invalid_image_path_examples),
         audit_ms=round(t1 - t0, 2),
     )
 
@@ -334,6 +346,12 @@ def resolve_dataset(
         FileNotFoundError : If the CSV cannot be found.
         ValueError        : If both or neither arguments are provided.
     """
+    # Normalize inputs
+    if filename is not None:
+        filename = filename.strip() if isinstance(filename, str) else filename
+    if dataset_name is not None:
+        dataset_name = dataset_name.strip() if isinstance(dataset_name, str) else dataset_name
+
     if filename and dataset_name:
         raise ValueError(
             _registry_error(
@@ -529,6 +547,8 @@ def resolve_dataset_group(group_name: str) -> tuple:
         KeyError  : If group_name is not registered.
         ValueError : If group resolves to zero valid CSVs.
     """
+    # Normalize group name
+    group_name = group_name.strip() if isinstance(group_name, str) else group_name
     if group_name not in REGISTERED_DATASETS:
         available = sorted(REGISTERED_DATASETS.keys())
         raise KeyError(
@@ -643,6 +663,8 @@ if __name__ == "__main__":
             # Image semantics
             chk("image_support_status", sample.image_support_status == "image_path_column_present")
             chk("image_path_policy", sample.image_path_policy == "use_image_path_then_asin")
+            chk("invalid_img_path_count", isinstance(sample.invalid_image_path_count, int))
+            chk("invalid_img_path_examples", isinstance(sample.invalid_image_path_examples, tuple))
 
         # Check domain CSVs have no image_path column
         for d in descs:
@@ -734,6 +756,21 @@ if __name__ == "__main__":
         chk("synth images missing=2", synth.image_missing_count == 2)
         chk("synth no_images_found", synth.image_support_status == "no_images_found")
         chk("synth asin_jpg policy", synth.image_path_policy == "use_asin_jpg")
+        chk("synth no invalid paths", synth.invalid_image_path_count == 0)
+
+        # Synthetic CSV with bad image_path (traversal)
+        bad_img_csv = os.path.join(_tmp_dir, "bad_img.csv")
+        with open(bad_img_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["asin", "text", "image_url", "price", "rating_number", "category", "rating", "image_path"])
+            w.writerow(["X001", "test", "http://x", "10", "5", "cat", "4.0", "../escape.jpg"])
+            w.writerow(["X002", "test2", "http://y", "20", "3", "cat", "3.0", "B001.jpg"])
+        bad_img_desc = _audit_single_csv(Path(bad_img_csv))
+        chk("bad_img rows=2", bad_img_desc.row_count == 2)
+        chk("bad_img has image_path", bad_img_desc.has_image_path_column is True)
+        chk("bad_img invalid count=1", bad_img_desc.invalid_image_path_count == 1)
+        chk("bad_img examples len", len(bad_img_desc.invalid_image_path_examples) == 1)
+        chk("bad_img schema valid", bad_img_desc.schema_valid is True)
 
         bad_csv = os.path.join(_tmp_dir, "bad.csv")
         with open(bad_csv, "w", newline="") as f:
@@ -792,6 +829,14 @@ if __name__ == "__main__":
             chk("missing group raises", False)
         except KeyError:
             chk("missing group raises", True)
+
+        # Normalized group name
+        norm_group = resolve_dataset_group(" sample ")
+        chk("norm group == sample", norm_group == sample_group)
+
+        # Normalized resolve_dataset
+        norm_desc = resolve_dataset(dataset_name=" sample_100 ")
+        chk("norm resolve", norm_desc.filename == "sample_100.csv")
 
         # ---- Summary ----
         print(f"\n{'='*60}")

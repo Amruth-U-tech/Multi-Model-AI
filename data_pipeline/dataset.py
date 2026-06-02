@@ -230,10 +230,11 @@ def resolve_image_path(
         (resolved_path_str, used_fallback, reason)
 
     Path routing:
-      - If image_path column is missing entirely -> ASIN fallback.
-      - If raw path is absolute and inside IMAGE_DATASET_DIR -> use as-is.
-      - If raw path is relative and non-empty -> resolve via resolve_image_file (safe).
-      - If raw path is missing/empty/NaN -> fallback to IMAGE_DATASET_DIR/{asin}.jpg.
+      - If image_path column is missing entirely -> ASIN fallback (safe).
+      - If raw path is missing/empty/NaN         -> ASIN fallback (safe).
+      - If raw path is absolute inside IMAGE_DATASET_DIR -> use as-is.
+      - If raw path is relative and passes traversal check -> resolve.
+      - If raw path is traversal/unsafe/absolute outside base -> FATAL.
     """
     # If column doesn't exist, go straight to ASIN fallback
     if not has_image_path_column:
@@ -247,56 +248,73 @@ def resolve_image_path(
 
     raw = row.get(image_path_column) if isinstance(row, dict) else getattr(row, image_path_column, None)
 
-    # -- Check for usable string path --
-    if raw is not None and isinstance(raw, str) and raw.strip():
-        cleaned = raw.strip()
-        p = Path(cleaned)
-        if p.is_absolute():
-            # Absolute paths: verify inside IMAGE_DATASET_DIR
-            resolved = p.resolve()
-            img_base = IMAGE_DATASET_DIR.resolve()
-            if resolved == img_base or img_base in resolved.parents:
-                return str(resolved), False, "absolute_path"
-            # Absolute outside IMAGE_DATASET_DIR: reject
-            raise ValueError(
-                f"[DATASET ERROR] Absolute image path outside IMAGE_DATASET_DIR.\n"
-                f"  Path : {resolved}\n"
-                f"  Base : {img_base}\n"
-                f"  Resolution: Use relative paths or move images into IMAGE_DATASET_DIR."
-            )
-        # Relative path -> resolve via resolve_image_file (traversal-safe)
+    # -- Handle missing/NaN: ASIN fallback is safe --
+    raw_is_missing = (
+        raw is None
+        or (isinstance(raw, str) and not raw.strip())
+        or (isinstance(raw, float) and math.isnan(raw))
+    )
+    if not raw_is_missing:
+        # Also check pandas NA
         try:
-            resolved = resolve_image_file(cleaned)
-            return str(resolved), False, "relative_resolved"
-        except ValueError:
-            # Traversal or bad path -> fall back to ASIN
-            fallback = str(resolve_image_file(asin))
-            return fallback, True, "relative_path_unsafe_asin_fallback"
-
-    # -- Check for NaN float (pandas missing) --
-    if raw is not None:
-        try:
-            if isinstance(raw, float) and math.isnan(raw):
-                pass  # fall through to ASIN fallback
-            else:
-                s = str(raw).strip()
-                if s:
-                    try:
-                        resolved = resolve_image_file(s)
-                        return str(resolved), False, "relative_resolved"
-                    except ValueError:
-                        pass  # traversal blocked -> ASIN fallback
-        except (TypeError, ValueError):
+            import pandas as pd
+            if pd.isna(raw):
+                raw_is_missing = True
+        except (ImportError, TypeError, ValueError):
             pass
+    if raw_is_missing:
+        if not asin or not str(asin).strip():
+            raise ValueError(
+                f"[DATASET ERROR] Cannot construct fallback image path: "
+                f"ASIN is empty/missing. image_path_column='{image_path_column}'"
+            )
+        fallback = str(resolve_image_file(asin))
+        return fallback, True, "asin_fallback"
 
-    # -- Fallback: IMAGE_DATASET_DIR / {asin}.jpg --
-    if not asin or not str(asin).strip():
+    # -- Convert to string and validate --
+    raw_str = str(raw).strip() if raw is not None else ""
+    if not raw_str:
+        # Empty string after conversion: ASIN fallback
+        fallback = str(resolve_image_file(asin))
+        return fallback, True, "asin_fallback"
+
+    # -- Non-empty path present: MUST be safe or fail loudly --
+    p = Path(raw_str)
+    if p.is_absolute():
+        # Absolute paths: verify inside IMAGE_DATASET_DIR
+        resolved = p.resolve()
+        img_base = IMAGE_DATASET_DIR.resolve()
+        if resolved == img_base or img_base in resolved.parents:
+            return str(resolved), False, "absolute_path"
+        # Absolute outside IMAGE_DATASET_DIR: FATAL
         raise ValueError(
-            f"[DATASET ERROR] Cannot construct fallback image path: "
-            f"ASIN is empty/missing. image_path_column='{image_path_column}'"
+            f"[DATASET ERROR] Stage: image_path_resolution\n"
+            f"  ASIN            : {asin}\n"
+            f"  Column          : {image_path_column}\n"
+            f"  Received path   : {raw_str}\n"
+            f"  Resolved to     : {resolved}\n"
+            f"  Expected base   : {img_base}\n"
+            f"  Error           : Absolute image path outside IMAGE_DATASET_DIR.\n"
+            f"  Resolution      : Use relative paths or move images into IMAGE_DATASET_DIR."
         )
-    fallback = str(resolve_image_file(asin))
-    return fallback, True, "asin_fallback"
+
+    # Relative path -> resolve via resolve_image_file (traversal-safe)
+    # If traversal is detected, this MUST be fatal, not a silent fallback.
+    try:
+        resolved = resolve_image_file(raw_str)
+        return str(resolved), False, "relative_resolved"
+    except ValueError as exc:
+        # Traversal or malformed path: FATAL with full context
+        raise ValueError(
+            f"[DATASET ERROR] Stage: image_path_resolution\n"
+            f"  ASIN            : {asin}\n"
+            f"  Column          : {image_path_column}\n"
+            f"  Received path   : {raw_str}\n"
+            f"  Error           : Unsafe image path blocked by traversal guard.\n"
+            f"  Detail          : {exc}\n"
+            f"  Resolution      : Fix the image_path value in the source CSV. "
+            f"Use simple filenames like 'B001.jpg', not '../escape.jpg'."
+        ) from exc
 
 
 # =============================================================================
@@ -381,12 +399,16 @@ class MultimodalProductDataset(_torch_data.Dataset):
             dup_mask = asin_col.duplicated(keep=False)
             dup_count = dup_mask.sum()
             if dup_count > 0:
-                examples = asin_col[dup_mask].head(5).tolist()
+                examples = asin_col[dup_mask].unique()[:5].tolist()
                 raise ValueError(
                     f"[DATASET ERROR] {dup_count} duplicate ASINs across "
-                    f"{len(frames)} sources. Examples: {examples}. "
-                    f"Multi-source datasets require globally unique ASINs. "
-                    f"Resolution: deduplicate CSVs or use separate DatasetConfig objects."
+                    f"{len(frames)} source files (source_files routing).\n"
+                    f"  Duplicate examples : {examples}\n"
+                    f"  Source files       : {list(config.source_files)}\n"
+                    f"  Multi-source datasets require globally unique ASINs.\n"
+                    f"  Resolution: deduplicate CSVs, use non-overlapping sources, "
+                    f"or use dataset_name='sample' for current smoke training.\n"
+                    f"  Split/dedup policy is intentionally deferred."
                 )
         elif config.dataset_name is not None:
             # Registry lookup: check groups first, then single-file
@@ -413,12 +435,15 @@ class MultimodalProductDataset(_torch_data.Dataset):
                 dup_mask_g = asin_col_g.duplicated(keep=False)
                 dup_count_g = dup_mask_g.sum()
                 if dup_count_g > 0:
-                    examples_g = asin_col_g[dup_mask_g].head(5).tolist()
+                    examples_g = asin_col_g[dup_mask_g].unique()[:5].tolist()
                     raise ValueError(
                         f"[DATASET ERROR] {dup_count_g} duplicate ASINs across group "
-                        f"'{config.dataset_name}' ({len(frames_g)} sources). "
-                        f"Examples: {examples_g}. "
-                        f"Resolution: deduplicate CSVs or use non-overlapping sources."
+                        f"'{config.dataset_name}' ({len(frames_g)} source files).\n"
+                        f"  Duplicate examples : {examples_g}\n"
+                        f"  Group sources      : {list(group_files)}\n"
+                        f"  Resolution: Use dataset_name='sample' for current smoke "
+                        f"training, or create a non-overlapping registry group.\n"
+                        f"  Split/dedup policy is intentionally deferred."
                     )
             else:
                 # Single-file logical lookup

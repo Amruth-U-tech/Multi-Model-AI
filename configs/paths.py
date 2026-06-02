@@ -440,8 +440,22 @@ def get_dataset_csv(filename: str) -> Path:
         FileNotFoundError : If the CSV file does not exist.
         ValueError         : If the path escapes PREPROCESSED_DATASET_DIR.
     """
+    if not isinstance(filename, str):
+        raise TypeError(f"Dataset CSV filename must be str, got {type(filename).__name__}")
+    filename = filename.strip()
     if not filename:
-        raise ValueError("Dataset CSV filename cannot be empty.")
+        raise ValueError("Dataset CSV filename cannot be whitespace only.")
+
+    # Reject absolute paths that point outside PREPROCESSED_DATASET_DIR
+    if Path(filename).is_absolute():
+        abs_resolved = Path(filename).resolve()
+        base_resolved = PREPROCESSED_DATASET_DIR.resolve()
+        if abs_resolved != base_resolved and base_resolved not in abs_resolved.parents:
+            raise ValueError(
+                f"PATH TRAVERSAL BLOCKED (get_dataset_csv).\n"
+                f"  Absolute path '{filename}' is outside PREPROCESSED_DATASET_DIR.\n"
+                f"  Resolution : Use a simple filename like 'sample_100.csv'."
+            )
 
     csv_path = _ensure_child_path(
         PREPROCESSED_DATASET_DIR,
@@ -528,6 +542,18 @@ def resolve_image_file(filename_or_asin: str) -> Path:
     name = filename_or_asin.strip()
     if not name:
         raise ValueError("resolve_image_file: filename/ASIN is empty after stripping.")
+
+    # Reject absolute paths outside IMAGE_DATASET_DIR
+    if Path(name).is_absolute():
+        abs_resolved = Path(name).resolve()
+        base_resolved = IMAGE_DATASET_DIR.resolve()
+        if abs_resolved != base_resolved and base_resolved not in abs_resolved.parents:
+            raise ValueError(
+                f"PATH TRAVERSAL BLOCKED (resolve_image_file).\n"
+                f"  Absolute path '{name}' is outside IMAGE_DATASET_DIR.\n"
+                f"  Resolution : Use a simple filename like 'B001.jpg' or a bare ASIN."
+            )
+
     # If no extension, assume .jpg (the standard image format for this pipeline)
     if "." not in name:
         name = f"{name}.jpg"

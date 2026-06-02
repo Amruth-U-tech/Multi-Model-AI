@@ -14,3 +14,24 @@ issues_file_dependencies.txt
 
 #ignore model files
 __pycache__/
+
+# HuggingFace / transformers cache
+cache/
+.huggingface/
+hf_cache/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Torch checkpoints / runtime artifacts
+checkpoints/
+runs/
+logs/
+
+# Notebook noise
+.ipynb_checkpoints/
+
+# OS noise
+.DS_Store
+Thumbs.db
