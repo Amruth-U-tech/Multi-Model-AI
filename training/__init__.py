@@ -13,6 +13,12 @@ from training.train_config import (
     build_train_config,
 )
 
+from training.run_context import (
+    RunContext,
+    RunContextError,
+    build_run_context,
+)
+
 __all__ = [
     "TrainConfig",
     "TrainConfigError",
@@ -20,4 +26,7 @@ __all__ = [
     "ConfigState",
     "OVERRIDABLE_FIELDS",
     "build_train_config",
+    "RunContext",
+    "RunContextError",
+    "build_run_context",
 ]

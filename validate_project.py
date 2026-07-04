@@ -554,6 +554,7 @@ def validate_models(t: ValidationTracker, quick: bool = False):
 def validate_training_contracts(t: ValidationTracker):
     t.section("8. Training Contracts")
 
+    # -- TrainConfig checks (existing) -----------------------------------------
     try:
         from training.train_config import (
             TrainConfig, TrainConfigError, ConfigFrozenError,
@@ -597,6 +598,77 @@ def validate_training_contracts(t: ValidationTracker):
     except Exception as e:
         t.fail("training contracts", str(e)[:200])
 
+    # -- RunContext checks -----------------------------------------------------
+    try:
+        from training.run_context import (
+            RunContext, RunContextError, build_run_context,
+        )
+        t.check("RunContext imported", True)
+        t.check("build_run_context imported", True)
+
+        # Package-level export
+        try:
+            from training import RunContext as _RC, build_run_context as _brc
+            t.check("package export: RunContext", True)
+            t.check("package export: build_run_context", True)
+        except ImportError:
+            t.fail("package export: RunContext", "not in training/__init__.py")
+
+        # Build RunContext from frozen config (CPU path -- deterministic)
+        from training.train_config import build_train_config as _btc
+        rc_cfg = _btc(device="cpu")
+        rc_cfg.freeze()
+        ctx = build_run_context(rc_cfg)
+        t.check("RunContext builds from frozen config", ctx is not None)
+        t.check("runtime device is cpu", ctx.device == "cpu")
+
+        # Serialization surface
+        rc_dict = ctx.as_dict()
+        t.check("RunContext as_dict returns dict",
+                isinstance(rc_dict, dict) and "device" in rc_dict)
+
+        rc_summary = ctx.summary()
+        t.check("RunContext summary returns string",
+                isinstance(rc_summary, str) and len(rc_summary) > 50)
+
+        # Immutability guard
+        try:
+            ctx.device = "tpu"
+            t.fail("RunContext immutability guard", "should have raised AttributeError")
+        except AttributeError:
+            t.expected("RunContext immutability guard blocks mutation")
+
+        # Unfrozen config rejected
+        try:
+            unfrozen_cfg = _btc(device="cpu")  # validated but NOT frozen
+            build_run_context(unfrozen_cfg)
+            t.fail("RunContext rejects unfrozen config", "should have raised")
+        except RunContextError:
+            t.expected("RunContext rejects unfrozen config")
+
+        # Bad config type rejected
+        try:
+            build_run_context({"device": "cpu"})
+            t.fail("RunContext rejects bad config type", "should have raised")
+        except RunContextError:
+            t.expected("RunContext rejects bad config type")
+
+        # CUDA guard on CPU-only machine
+        import torch
+        if not torch.cuda.is_available():
+            try:
+                cuda_cfg = _btc(device="cuda")
+                cuda_cfg.freeze()
+                build_run_context(cuda_cfg)
+                t.fail("RunContext CUDA guard", "should have raised on CPU-only")
+            except RunContextError:
+                t.expected("RunContext CUDA guard rejects cuda on CPU-only")
+
+    except ImportError as e:
+        t.fail("RunContext import", str(e)[:200])
+    except Exception as e:
+        t.fail("RunContext contracts", str(e)[:200])
+
 
 # =============================================================================
 # Stage 9: Local Smoke Tests (optional subprocess)
@@ -614,6 +686,7 @@ _SMOKE_FILES = [
     "models/image_encoder.py",
     "models/text_encoder.py",
     "training/train_config.py",
+    "training/run_context.py",
 ]
 
 
