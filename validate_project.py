@@ -548,7 +548,58 @@ def validate_models(t: ValidationTracker, quick: bool = False):
 
 
 # =============================================================================
-# Stage 8: Local Smoke Tests (optional subprocess)
+# Stage 8: Training Contracts
+# =============================================================================
+
+def validate_training_contracts(t: ValidationTracker):
+    t.section("8. Training Contracts")
+
+    try:
+        from training.train_config import (
+            TrainConfig, TrainConfigError, ConfigFrozenError,
+            ConfigState, build_train_config,
+        )
+        t.check("TrainConfig imported", True)
+
+        # Default construct + validate
+        cfg = TrainConfig()
+        cfg.validate()
+        t.check("default config validates", cfg.state == ConfigState.VALIDATED)
+
+        # Freeze
+        cfg.freeze()
+        t.check("config freezes", cfg.state == ConfigState.FROZEN)
+
+        # Frozen mutation rejected
+        try:
+            cfg.learning_rate = 0.1
+            t.fail("frozen mutation guard", "should have raised ConfigFrozenError")
+        except ConfigFrozenError:
+            t.expected("frozen mutation guard blocks assignment")
+
+        # Checkpoint traversal rejected
+        try:
+            TrainConfig(
+                resume=True,
+                resume_checkpoint="../checkpoints_evil/model.pt"
+            ).validate()
+            t.fail("checkpoint traversal guard", "should have raised")
+        except TrainConfigError:
+            t.expected("checkpoint traversal guard blocks escape")
+
+        # as_dict
+        cfg2 = build_train_config()
+        d = cfg2.as_dict()
+        t.check("as_dict returns dict", isinstance(d, dict) and "epochs" in d)
+
+    except ImportError as e:
+        t.fail("TrainConfig import", str(e)[:200])
+    except Exception as e:
+        t.fail("training contracts", str(e)[:200])
+
+
+# =============================================================================
+# Stage 9: Local Smoke Tests (optional subprocess)
 # =============================================================================
 
 _SMOKE_FILES = [
@@ -562,11 +613,12 @@ _SMOKE_FILES = [
     "models/tabular_encoder.py",
     "models/image_encoder.py",
     "models/text_encoder.py",
+    "training/train_config.py",
 ]
 
 
 def validate_smoke_tests(t: ValidationTracker, run_smoke: bool = False):
-    t.section("8. Local Smoke Tests")
+    t.section("9. Local Smoke Tests")
 
     if not run_smoke:
         t.skip("local smoke tests", "use --run-smoke to execute")
@@ -743,6 +795,7 @@ def main():
     validate_dataset(t, quick=quick)
     validate_pipeline(t, quick=quick)
     validate_models(t, quick=quick)
+    validate_training_contracts(t)
     validate_smoke_tests(t, run_smoke=args.run_smoke)
 
     score = print_summary(t, print_json=args.json, json_out_path=args.json_out)
