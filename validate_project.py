@@ -669,6 +669,152 @@ def validate_training_contracts(t: ValidationTracker):
     except Exception as e:
         t.fail("RunContext contracts", str(e)[:200])
 
+    # -- Optimizer checks ------------------------------------------------------
+    try:
+        from training.optimizer import (
+            OptimizerError, build_optimizer,
+            validate_optimizer_inputs, summarize_optimizer, optimizer_to_dict,
+        )
+        t.check("optimizer imported", True)
+
+        # Package-level export
+        try:
+            from training import OptimizerError as _OE, build_optimizer as _bo
+            t.check("package export: OptimizerError", True)
+            t.check("package export: build_optimizer", True)
+        except ImportError:
+            t.fail("package export: build_optimizer", "not in training/__init__.py")
+
+        # Build optimizer on dummy model (CPU, deterministic)
+        import torch.nn as _nn
+        class _DummyModel(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = _nn.Linear(4, 1)
+            def forward(self, x):
+                return self.fc(x)
+
+        from training.train_config import build_train_config as _btc2
+        from training.run_context import build_run_context as _brc2
+        opt_cfg = _btc2(optimizer="adamw", device="cpu")
+        opt_cfg.freeze()
+        opt_ctx = _brc2(opt_cfg)
+        dummy = _DummyModel()
+        opt = build_optimizer(opt_cfg, opt_ctx, dummy)
+        t.check("optimizer builds on dummy model", opt is not None)
+
+        import torch.optim as _optim
+        t.check("optimizer is AdamW", isinstance(opt, _optim.AdamW))
+
+        # Summary helper
+        opt_summary = summarize_optimizer(opt, model=dummy, config=opt_cfg)
+        t.check("optimizer summary returns string",
+                isinstance(opt_summary, str) and len(opt_summary) > 50)
+
+        # Serialization helper
+        opt_dict = optimizer_to_dict(opt, model=dummy, config=opt_cfg)
+        t.check("optimizer_to_dict returns dict",
+                isinstance(opt_dict, dict) and "optimizer_type" in opt_dict)
+
+        # Bad config type rejected
+        try:
+            build_optimizer({"optimizer": "adamw"}, opt_ctx, dummy)
+            t.fail("optimizer rejects bad config", "should have raised")
+        except OptimizerError:
+            t.expected("optimizer rejects bad config type")
+
+        # Bad model type rejected
+        try:
+            build_optimizer(opt_cfg, opt_ctx, "not_a_model")
+            t.fail("optimizer rejects bad model", "should have raised")
+        except OptimizerError:
+            t.expected("optimizer rejects bad model type")
+
+        # Duplicate parameter guard
+        class _DupGroupModel(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = _nn.Linear(4, 1)
+            def forward(self, x):
+                return self.fc(x)
+            def get_optimizer_parameter_groups(self):
+                params = list(self.fc.parameters())
+                return [
+                    {"name": "A", "params": params},
+                    {"name": "B", "params": params},
+                ]
+
+        try:
+            build_optimizer(opt_cfg, opt_ctx, _DupGroupModel())
+            t.fail("optimizer duplicate param guard", "should have raised")
+        except OptimizerError:
+            t.expected("optimizer duplicate param guard blocks overlap")
+
+        # Zero trainable params guard
+        class _FrozenModel(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = _nn.Linear(4, 1)
+                for p in self.parameters():
+                    p.requires_grad = False
+            def forward(self, x):
+                return self.fc(x)
+
+        try:
+            build_optimizer(opt_cfg, opt_ctx, _FrozenModel())
+            t.fail("optimizer frozen model guard", "should have raised")
+        except OptimizerError:
+            t.expected("optimizer frozen model guard blocks zero params")
+
+        # Config/context mismatch rejected
+        opt_cfg_b = _btc2(optimizer="adamw", device="cpu")
+        opt_cfg_b.freeze()
+        opt_ctx_b = _brc2(opt_cfg_b)
+        try:
+            build_optimizer(opt_cfg, opt_ctx_b, dummy)  # cfg A + ctx B
+            t.fail("optimizer config/context mismatch", "should have raised")
+        except OptimizerError:
+            t.expected("optimizer config/context mismatch rejected")
+
+        # Grouped model preserves semantic metadata
+        from training.optimizer import get_optimizer_metadata as _gom
+        class _GroupedModel(_nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = _nn.Linear(4, 8)
+                self.head = _nn.Linear(8, 1)
+            def forward(self, x):
+                return self.head(self.backbone(x))
+            def get_optimizer_parameter_groups(self):
+                return [
+                    {"name": "Backbone", "params": self.backbone.parameters()},
+                    {"name": "Head", "params": self.head.parameters()},
+                ]
+
+        gopt = build_optimizer(opt_cfg, opt_ctx, _GroupedModel())
+        gdict = optimizer_to_dict(gopt)
+        t.check("grouped dict has semantic names",
+                gdict["groups"][0].get("name") == "Backbone"
+                and gdict["groups"][1].get("name") == "Head")
+        t.check("grouped dict has used_model_api",
+                gdict.get("used_model_api") is True)
+
+        gsummary = summarize_optimizer(gopt)
+        t.check("grouped summary has semantic names",
+                "Backbone" in gsummary and "Head" in gsummary)
+
+        # Fallback metadata
+        fdict = optimizer_to_dict(opt)
+        t.check("fallback dict has used_model_api=False",
+                fdict.get("used_model_api") is False)
+        t.check("fallback dict group named all_trainable",
+                fdict["groups"][0].get("name") == "all_trainable")
+
+    except ImportError as e:
+        t.fail("optimizer import", str(e)[:200])
+    except Exception as e:
+        t.fail("optimizer contracts", str(e)[:200])
+
 
 # =============================================================================
 # Stage 9: Local Smoke Tests (optional subprocess)
@@ -687,6 +833,7 @@ _SMOKE_FILES = [
     "models/text_encoder.py",
     "training/train_config.py",
     "training/run_context.py",
+    "training/optimizer.py",
 ]
 
 

@@ -19,6 +19,16 @@ from training.run_context import (
     build_run_context,
 )
 
+from training.optimizer import (
+    OptimizerError,
+    OptimizerMetadata,
+    build_optimizer,
+    validate_optimizer_inputs,
+    summarize_optimizer,
+    optimizer_to_dict,
+    get_optimizer_metadata,
+)
+
 __all__ = [
     "TrainConfig",
     "TrainConfigError",
@@ -29,4 +39,11 @@ __all__ = [
     "RunContext",
     "RunContextError",
     "build_run_context",
+    "OptimizerError",
+    "OptimizerMetadata",
+    "build_optimizer",
+    "validate_optimizer_inputs",
+    "summarize_optimizer",
+    "optimizer_to_dict",
+    "get_optimizer_metadata",
 ]
