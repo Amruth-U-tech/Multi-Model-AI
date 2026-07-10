@@ -941,6 +941,161 @@ def validate_training_contracts(t: ValidationTracker):
     except Exception as e:
         t.fail("scheduler contracts", str(e)[:200])
 
+    # -- Evaluation checks -----------------------------------------------------
+    try:
+        from training.evaluation import (
+            EvaluationError, EvaluationMetadata, EvaluationRuntimeState,
+            EvaluationResult, Evaluator, build_evaluator,
+            compute_loss, compute_metrics, extract_prediction,
+        )
+        t.check("evaluation imported", True)
+
+        # Package-level export
+        try:
+            from training import EvaluationError as _EE, build_evaluator as _be
+            t.check("package export: EvaluationError", True)
+            t.check("package export: build_evaluator", True)
+        except ImportError:
+            t.fail("package export: build_evaluator", "not in training/__init__.py")
+
+        # Build evaluator on dummy config
+        from training.train_config import build_train_config as _btc4
+        from training.run_context import build_run_context as _brc4
+        e_cfg = _btc4(loss_name="mse", device="cpu")
+        e_cfg.freeze()
+        e_ctx = _brc4(e_cfg)
+        ev = build_evaluator(e_cfg, e_ctx)
+        t.check("evaluator builds", ev is not None)
+        t.check("evaluator metadata", ev.metadata.problem_type == "regression")
+        t.check("evaluator loss_name", ev.metadata.loss_name == "mse")
+
+        import torch as _t4
+
+        # Valid MSE loss
+        _p = _t4.tensor([1.0, 2.0, 3.0])
+        _tgt = _t4.tensor([1.5, 2.5, 3.5])
+        _loss = compute_loss(_p, _tgt, e_cfg)
+        t.check("MSE loss computes", isinstance(_loss, _t4.Tensor) and _loss.dim() == 0)
+
+        # Valid MAE loss
+        e_cfg_mae = _btc4(loss_name="mae", device="cpu")
+        e_cfg_mae.freeze()
+        _loss_mae = compute_loss(_p, _tgt, e_cfg_mae)
+        t.check("MAE loss computes", _loss_mae.dim() == 0)
+
+        # Valid Huber loss
+        e_cfg_hub = _btc4(loss_name="huber", device="cpu")
+        e_cfg_hub.freeze()
+        _loss_hub = compute_loss(_p, _tgt, e_cfg_hub)
+        t.check("Huber loss computes", _loss_hub.dim() == 0)
+
+        # Metrics
+        _m = compute_metrics(_p, _tgt)
+        t.check("metrics has r2", "r2" in _m and isinstance(_m["r2"], float))
+        t.check("metrics has rmse", "rmse" in _m and isinstance(_m["rmse"], float))
+
+        # Dict prediction extraction
+        _pred_dict = {"rating_prediction": _t4.tensor([1.0, 2.0])}
+        _ext = extract_prediction(_pred_dict)
+        t.check("dict extraction works", isinstance(_ext, _t4.Tensor))
+
+        # Missing prediction key
+        try:
+            extract_prediction({"embedding": _t4.randn(4)})
+            t.fail("missing prediction key", "should have raised")
+        except EvaluationError:
+            t.expected("missing prediction key rejected")
+
+        # Shape mismatch
+        try:
+            compute_metrics(_t4.tensor([1.0, 2.0]), _t4.tensor([1.0, 2.0, 3.0]))
+            t.fail("shape mismatch", "should have raised")
+        except EvaluationError:
+            t.expected("shape mismatch rejected")
+
+        # NaN prediction
+        try:
+            compute_metrics(_t4.tensor([1.0, float('nan')]), _t4.tensor([1.0, 2.0]))
+            t.fail("NaN prediction", "should have raised")
+        except EvaluationError:
+            t.expected("NaN prediction rejected")
+
+        # Inf target
+        try:
+            compute_metrics(_t4.tensor([1.0, 2.0]), _t4.tensor([1.0, float('inf')]))
+            t.fail("Inf target", "should have raised")
+        except EvaluationError:
+            t.expected("Inf target rejected")
+
+        # R2 constant-target stability
+        _const = _t4.tensor([3.0, 3.0, 3.0])
+        _m_const = compute_metrics(_const.clone(), _const)
+        t.check("R2 constant perfect=1.0", _m_const["r2"] == 1.0)
+
+        # Best-validation tracking
+        r_val = ev.evaluate(_p, _tgt, split="validation", epoch=1)
+        is_best = ev.update_best(r_val)
+        t.check("first epoch is best", is_best is True)
+        t.check("best epoch set", ev.state.best_validation_epoch == 1)
+
+        # Non-validation rejected
+        r_train = ev.evaluate(_p, _tgt, split="train", epoch=2)
+        try:
+            ev.update_best(r_train)
+            t.fail("train update_best rejected", "should have raised")
+        except EvaluationError:
+            t.expected("train update_best rejected")
+
+        # Config/context mismatch
+        e_cfg_b = _btc4(loss_name="mae", device="cpu")
+        e_cfg_b.freeze()
+        e_ctx_b = _brc4(e_cfg_b)
+        try:
+            build_evaluator(e_cfg, e_ctx_b)
+            t.fail("evaluation config/context mismatch", "should have raised")
+        except EvaluationError:
+            t.expected("evaluation config/context mismatch rejected")
+
+        # Complex tensor rejection
+        try:
+            compute_metrics(_t4.tensor([1.0+0j, 2.0+0j]), _t4.tensor([1.0, 2.0]))
+            t.fail("complex tensor rejection", "should have raised")
+        except EvaluationError:
+            t.expected("complex tensor rejected")
+
+        # Unfrozen compute_loss rejection
+        try:
+            _unfr = _btc4(loss_name="mse", device="cpu")
+            compute_loss(_p, _tgt, _unfr)
+            t.fail("unfrozen compute_loss rejection", "should have raised")
+        except EvaluationError:
+            t.expected("unfrozen compute_loss rejected")
+
+        # Batch-level update_best rejection
+        try:
+            ev2 = build_evaluator(e_cfg, e_ctx)
+            br = ev2.evaluate(_p, _tgt, split="validation", epoch=1, batch_index=3)
+            ev2.update_best(br)
+            t.fail("batch update_best rejection", "should have raised")
+        except EvaluationError:
+            t.expected("batch update_best rejected")
+
+        # Duplicate epoch update_best rejection
+        try:
+            ev3 = build_evaluator(e_cfg, e_ctx)
+            dr1 = ev3.evaluate(_p, _tgt, split="validation", epoch=1)
+            ev3.update_best(dr1)
+            dr1b = ev3.evaluate(_p, _tgt, split="validation", epoch=1)
+            ev3.update_best(dr1b)
+            t.fail("duplicate epoch rejection", "should have raised")
+        except EvaluationError:
+            t.expected("duplicate epoch update_best rejected")
+
+    except ImportError as e:
+        t.fail("evaluation import", str(e)[:200])
+    except Exception as e:
+        t.fail("evaluation contracts", str(e)[:200])
+
 
 # =============================================================================
 # Stage 9: Local Smoke Tests (optional subprocess)
@@ -961,6 +1116,7 @@ _SMOKE_FILES = [
     "training/run_context.py",
     "training/optimizer.py",
     "training/scheduler.py",
+    "training/evaluation.py",
 ]
 
 

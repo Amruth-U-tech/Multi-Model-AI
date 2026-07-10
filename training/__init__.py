@@ -39,6 +39,18 @@ from training.scheduler import (
     get_scheduler_metadata,
 )
 
+from training.evaluation import (
+    EvaluationError,
+    EvaluationMetadata,
+    EvaluationRuntimeState,
+    EvaluationResult,
+    Evaluator,
+    build_evaluator,
+    compute_loss,
+    compute_metrics,
+    extract_prediction,
+)
+
 __all__ = [
     "TrainConfig",
     "TrainConfigError",
@@ -63,4 +75,13 @@ __all__ = [
     "summarize_scheduler",
     "scheduler_to_dict",
     "get_scheduler_metadata",
+    "EvaluationError",
+    "EvaluationMetadata",
+    "EvaluationRuntimeState",
+    "EvaluationResult",
+    "Evaluator",
+    "build_evaluator",
+    "compute_loss",
+    "compute_metrics",
+    "extract_prediction",
 ]
