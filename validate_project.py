@@ -815,6 +815,132 @@ def validate_training_contracts(t: ValidationTracker):
     except Exception as e:
         t.fail("optimizer contracts", str(e)[:200])
 
+    # -- Scheduler checks ------------------------------------------------------
+    try:
+        from training.scheduler import (
+            SchedulerError, build_scheduler,
+            validate_scheduler_inputs, summarize_scheduler, scheduler_to_dict,
+            get_scheduler_metadata,
+        )
+        t.check("scheduler imported", True)
+
+        # Package-level export
+        try:
+            from training import SchedulerError as _SE, build_scheduler as _bs
+            t.check("package export: SchedulerError", True)
+            t.check("package export: build_scheduler", True)
+        except ImportError:
+            t.fail("package export: build_scheduler", "not in training/__init__.py")
+
+        # Build scheduler on dummy model (CPU, deterministic)
+        from training.train_config import build_train_config as _btc3
+        from training.run_context import build_run_context as _brc3
+        from training.optimizer import build_optimizer as _bo3
+        import torch.nn as _nn3
+        class _SchedDummy(_nn3.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = _nn3.Linear(4, 1)
+            def forward(self, x):
+                return self.fc(x)
+
+        s_cfg = _btc3(scheduler="cosine", device="cpu", warmup_epochs=2, epochs=20)
+        s_cfg.freeze()
+        s_ctx = _brc3(s_cfg)
+        s_opt = _bo3(s_cfg, s_ctx, _SchedDummy())
+        sched = build_scheduler(s_cfg, s_ctx, s_opt)
+        t.check("scheduler builds on dummy model", sched is not None)
+
+        s_meta = get_scheduler_metadata(sched)
+        t.check("scheduler metadata attached",
+                s_meta is not None and s_meta.scheduler_type == "cosine")
+        t.check("scheduler step_policy is epoch",
+                s_meta.step_policy == "epoch")
+
+        # Summary helper
+        s_summ = summarize_scheduler(sched)
+        t.check("scheduler summary returns string",
+                isinstance(s_summ, str) and len(s_summ) > 50)
+
+        # Serialization helper
+        s_dict = scheduler_to_dict(sched)
+        t.check("scheduler_to_dict returns dict",
+                isinstance(s_dict, dict) and "scheduler_type" in s_dict)
+
+        # Plateau step policy
+        p_cfg = _btc3(scheduler="plateau", device="cpu", warmup_epochs=0)
+        p_cfg.freeze()
+        p_ctx = _brc3(p_cfg)
+        p_opt = _bo3(p_cfg, p_ctx, _SchedDummy())
+        p_sched = build_scheduler(p_cfg, p_ctx, p_opt)
+        p_meta = get_scheduler_metadata(p_sched)
+        t.check("plateau step_policy is validation_metric",
+                p_meta.step_policy == "validation_metric")
+
+        # None scheduler no-op
+        n_cfg = _btc3(scheduler="none", device="cpu")
+        n_cfg.freeze()
+        n_ctx = _brc3(n_cfg)
+        n_opt = _bo3(n_cfg, n_ctx, _SchedDummy())
+        n_sched = build_scheduler(n_cfg, n_ctx, n_opt)
+        n_meta = get_scheduler_metadata(n_sched)
+        t.check("none scheduler type", n_meta.scheduler_type == "none")
+
+        # Config/context mismatch rejected
+        try:
+            build_scheduler(s_cfg, p_ctx, s_opt)
+            t.fail("scheduler config/context mismatch", "should have raised")
+        except SchedulerError:
+            t.expected("scheduler config/context mismatch rejected")
+
+        # Plateau + warmup rejection
+        try:
+            pw_cfg = _btc3(scheduler="plateau", device="cpu", warmup_epochs=3)
+            pw_cfg.freeze()
+            pw_ctx = _brc3(pw_cfg)
+            pw_opt = _bo3(pw_cfg, pw_ctx, _SchedDummy())
+            build_scheduler(pw_cfg, pw_ctx, pw_opt)
+            t.fail("plateau+warmup rejection", "should have raised")
+        except SchedulerError:
+            t.expected("plateau+warmup rejected")
+
+        # step_gamma > 1 rejection
+        try:
+            sg_cfg = _btc3(scheduler="step", device="cpu", warmup_epochs=0)
+            sg_cfg.step_gamma = 1.5
+            sg_cfg.freeze()
+            sg_ctx = _brc3(sg_cfg)
+            sg_opt = _bo3(sg_cfg, sg_ctx, _SchedDummy())
+            build_scheduler(sg_cfg, sg_ctx, sg_opt)
+            t.fail("step_gamma>1 rejection", "should have raised")
+        except SchedulerError:
+            t.expected("step_gamma>1 rejected")
+
+        # plateau_factor >= 1 rejection
+        try:
+            pf_cfg = _btc3(scheduler="plateau", device="cpu", warmup_epochs=0)
+            pf_cfg.plateau_factor = 1.0
+            pf_cfg.freeze()
+            pf_ctx = _brc3(pf_cfg)
+            pf_opt = _bo3(pf_cfg, pf_ctx, _SchedDummy())
+            build_scheduler(pf_cfg, pf_ctx, pf_opt)
+            t.fail("plateau_factor>=1 rejection", "should have raised")
+        except SchedulerError:
+            t.expected("plateau_factor>=1 rejected")
+
+        # Plateau metadata: step_policy and metric
+        t.check("plateau meta step_policy",
+                p_meta.step_policy == "validation_metric")
+        t.check("plateau meta metric_name",
+                p_meta.metric_name == "validation_loss")
+        t.check("plateau meta warmup_enabled false",
+                p_meta.warmup_enabled is False)
+
+    except ImportError as e:
+        t.fail("scheduler import", str(e)[:200])
+    except Exception as e:
+        t.fail("scheduler contracts", str(e)[:200])
+
 
 # =============================================================================
 # Stage 9: Local Smoke Tests (optional subprocess)
@@ -834,6 +960,7 @@ _SMOKE_FILES = [
     "training/train_config.py",
     "training/run_context.py",
     "training/optimizer.py",
+    "training/scheduler.py",
 ]
 
 

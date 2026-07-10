@@ -29,6 +29,16 @@ from training.optimizer import (
     get_optimizer_metadata,
 )
 
+from training.scheduler import (
+    SchedulerError,
+    SchedulerMetadata,
+    build_scheduler,
+    validate_scheduler_inputs,
+    summarize_scheduler,
+    scheduler_to_dict,
+    get_scheduler_metadata,
+)
+
 __all__ = [
     "TrainConfig",
     "TrainConfigError",
@@ -46,4 +56,11 @@ __all__ = [
     "summarize_optimizer",
     "optimizer_to_dict",
     "get_optimizer_metadata",
+    "SchedulerError",
+    "SchedulerMetadata",
+    "build_scheduler",
+    "validate_scheduler_inputs",
+    "summarize_scheduler",
+    "scheduler_to_dict",
+    "get_scheduler_metadata",
 ]
