@@ -51,6 +51,12 @@ from training.evaluation import (
     extract_prediction,
 )
 
+from training.trainer import (
+    Trainer,
+    TrainerError,
+    build_trainer,
+)
+
 __all__ = [
     "TrainConfig",
     "TrainConfigError",
@@ -84,4 +90,7 @@ __all__ = [
     "compute_loss",
     "compute_metrics",
     "extract_prediction",
+    "Trainer",
+    "TrainerError",
+    "build_trainer",
 ]

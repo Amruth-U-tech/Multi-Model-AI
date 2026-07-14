@@ -1098,6 +1098,217 @@ def validate_training_contracts(t: ValidationTracker):
 
 
 # =============================================================================
+# Stage 8b: Trainer Contract Validation
+# =============================================================================
+
+def validate_trainer_contracts(t: ValidationTracker):
+    t.section("8b. Trainer Contracts")
+    try:
+        from training.trainer import (
+            Trainer, TrainerError, build_trainer,
+            _TrainingEvent, _TrainerStatus, _VALID_TRANSITIONS,
+            _TERMINAL_STATUSES, _REQUIRED_MODEL_KEYS,
+            _REQUIRED_BATCH_KEYS, _CHECKPOINT_REQUIRED_KEYS,
+            _CHECKPOINT_VERSION, _TRAINER_SCHEMA_VERSION,
+            _assert_child_path, _gpu_memory_snapshot,
+            _validate_loader_like,
+        )
+        t.check("trainer imports", True)
+
+        # TrainerError is RuntimeError
+        t.check("TrainerError is RuntimeError", issubclass(TrainerError, RuntimeError))
+
+        # State machine: terminal states have no transitions
+        for ts in _TERMINAL_STATUSES:
+            t.check(f"terminal {ts.value} has no transitions",
+                    len(_VALID_TRANSITIONS.get(ts, set())) == 0)
+
+        # Event enum has required events
+        required_events = [
+            "INITIALIZED", "TRAINING_STARTED", "EPOCH_STARTED",
+            "TRAINING_COMPLETED", "TRAINING_INTERRUPTED", "TRAINING_FAILED",
+            "CHECKPOINT_SAVED", "VALIDATION_STARTED", "VALIDATION_COMPLETED",
+        ]
+        for ev in required_events:
+            t.check(f"event {ev} exists", hasattr(_TrainingEvent, ev))
+
+        # Required model keys
+        for key in ["image_encoder", "text_encoder", "tabular_encoder", "fusion_model"]:
+            t.check(f"model key '{key}' required", key in _REQUIRED_MODEL_KEYS)
+
+        # Required batch keys
+        for key in ["images", "input_ids", "attention_mask", "tabular", "ratings"]:
+            t.check(f"batch key '{key}' required", key in _REQUIRED_BATCH_KEYS)
+
+        # Checkpoint required keys -- original + hardened
+        for key in ["checkpoint_version", "model_state_dict", "optimizer_state_dict",
+                     "epoch", "global_step", "trainer_schema_version", "trainer_class"]:
+            t.check(f"checkpoint key '{key}' required", key in _CHECKPOINT_REQUIRED_KEYS)
+
+        # Schema version constants
+        t.check("TRAINER_SCHEMA_VERSION >= 1", _TRAINER_SCHEMA_VERSION >= 1)
+        t.check("CHECKPOINT_VERSION >= 1", _CHECKPOINT_VERSION >= 1)
+
+        # Module helpers exist and are callable
+        t.check("_assert_child_path callable", callable(_assert_child_path))
+        t.check("_gpu_memory_snapshot callable", callable(_gpu_memory_snapshot))
+        t.check("_validate_loader_like callable", callable(_validate_loader_like))
+
+        # _gpu_memory_snapshot returns expected keys
+        snap = _gpu_memory_snapshot()
+        for k in ("cuda_available", "device_name", "allocated_mb",
+                   "reserved_mb", "max_allocated_mb"):
+            t.check(f"gpu_snapshot has '{k}'", k in snap)
+
+        # Trainer class has hardened methods
+        for method in ("_validate_prediction_contract", "_validate_model_device",
+                       "_validate_batch_device", "_record_failure",
+                       "_restore_evaluator_state", "_validate_checkpoint_restore_contract",
+                       "_validate_optimizer_model_integrity"):
+            t.check(f"Trainer.{method} exists", hasattr(Trainer, method))
+
+        # build_trainer rejects non-config
+        import torch.nn as nn
+        try:
+            build_trainer(
+                config="bad", run_context=None, model_bundle=None,
+                optimizer=None, scheduler=None, evaluator=None,
+                train_loader=None,
+            )
+            t.fail("non-config rejection", "should have raised")
+        except TrainerError:
+            t.expected("non-config rejected")
+
+        # --- Common infra (save_best=False to avoid val_loader requirement) ---
+        from training.train_config import build_train_config
+        from training.run_context import build_run_context
+        from training.optimizer import build_optimizer
+        from training.scheduler import build_scheduler
+        from training.evaluation import build_evaluator
+
+        _tc = build_train_config(device="cpu", warmup_epochs=0, save_best=False)
+        _tc.freeze()
+        _rc = build_run_context(_tc)
+
+        # Missing model keys rejected
+        _md = nn.ModuleDict({"image_encoder": nn.Linear(2, 2)})
+        _op = build_optimizer(config=_tc, run_context=_rc, model=_md)
+        _sc = build_scheduler(config=_tc, run_context=_rc, optimizer=_op)
+        _ev = build_evaluator(_tc, _rc)
+        try:
+            build_trainer(
+                config=_tc, run_context=_rc, model_bundle=_md,
+                optimizer=_op, scheduler=_sc, evaluator=_ev,
+                train_loader=[{"x": 1}],
+            )
+            t.fail("missing model key rejection", "should have raised")
+        except TrainerError:
+            t.expected("missing model keys rejected")
+
+        # Non-iterable loader rejected
+        for bad_loader in [123, "bad", {}]:
+            try:
+                _validate_loader_like(bad_loader, "test")
+                t.fail(f"loader {type(bad_loader).__name__} rejected", "should have raised")
+            except TrainerError:
+                t.expected(f"loader {type(bad_loader).__name__} rejected")
+
+        # Path traversal rejected
+        import tempfile
+        from pathlib import Path as _VP
+        _vbase = _VP(tempfile.mkdtemp())
+        try:
+            _assert_child_path(_vbase, _vbase / ".." / "escape.pt", "test")
+            t.fail("path traversal rejection", "should have raised")
+        except TrainerError:
+            t.expected("path traversal rejected")
+
+        # save_best=True without val_loader rejected (expected guard)
+        _tc_sb = build_train_config(device="cpu", warmup_epochs=0, save_best=True)
+        _tc_sb.freeze()
+        _rc_sb = build_run_context(_tc_sb)
+        _full_md = nn.ModuleDict({
+            "image_encoder": nn.Linear(2, 2),
+            "text_encoder": nn.Linear(2, 2),
+            "tabular_encoder": nn.Linear(2, 2),
+            "fusion_model": nn.Linear(2, 2),
+        })
+        _op_sb = build_optimizer(config=_tc_sb, run_context=_rc_sb, model=_full_md)
+        _sc_sb = build_scheduler(config=_tc_sb, run_context=_rc_sb, optimizer=_op_sb)
+        _ev_sb = build_evaluator(_tc_sb, _rc_sb)
+        try:
+            build_trainer(
+                config=_tc_sb, run_context=_rc_sb, model_bundle=_full_md,
+                optimizer=_op_sb, scheduler=_sc_sb, evaluator=_ev_sb,
+                train_loader=[{"x": 1}], val_loader=None,
+                render_dashboard=False,
+            )
+            t.fail("save_best no val_loader rejected", "should have raised")
+        except TrainerError:
+            t.expected("save_best without val_loader rejected")
+
+        # Runtime state has AMP and timing fields
+        _full_md2 = nn.ModuleDict({
+            "image_encoder": nn.Linear(2, 2),
+            "text_encoder": nn.Linear(2, 2),
+            "tabular_encoder": nn.Linear(2, 2),
+            "fusion_model": nn.Linear(2, 2),
+        })
+        _op2 = build_optimizer(config=_tc, run_context=_rc, model=_full_md2)
+        _sc2 = build_scheduler(config=_tc, run_context=_rc, optimizer=_op2)
+        _ev2 = build_evaluator(_tc, _rc)
+        _tr = build_trainer(
+            config=_tc, run_context=_rc, model_bundle=_full_md2,
+            optimizer=_op2, scheduler=_sc2, evaluator=_ev2,
+            train_loader=[{"x": 1}], render_dashboard=False,
+        )
+        rt = _tr.runtime_state()
+        for fld in ("amp_status", "amp_fallback_reason", "train_time_seconds",
+                     "val_time_seconds", "checkpoint_time_seconds",
+                     "warning_count", "peak_gpu_memory_mb"):
+            t.check(f"runtime_state has '{fld}'", fld in rt)
+
+        # Prediction contract rejects bad shape
+        import torch
+        bad_pred = torch.randn(4, 1, 1)
+        good_tgt = torch.randn(4)
+        try:
+            _tr._validate_prediction_contract(bad_pred, good_tgt, 1, 1)
+            t.fail("bad prediction shape rejected", "should have raised")
+        except TrainerError:
+            t.expected("bad prediction shape rejected")
+
+        # Malformed evaluator restore rejected
+        try:
+            _tr._restore_evaluator_state({"evaluation": "not_a_dict"})
+            t.fail("malformed eval restore rejected", "should have raised")
+        except TrainerError:
+            t.expected("malformed eval restore rejected")
+
+        # Optimizer-model integrity passes normally
+        try:
+            _tr._validate_optimizer_model_integrity(1)
+            t.check("optimizer-model integrity normal", True)
+        except TrainerError:
+            t.fail("optimizer-model integrity normal", "unexpected error")
+
+        # Optimizer-model integrity detects replaced submodule
+        old_fm = _full_md2["fusion_model"]
+        _full_md2["fusion_model"] = nn.Linear(5, 1)
+        try:
+            _tr._validate_optimizer_model_integrity(1)
+            t.fail("replaced submodule rejected", "should have raised")
+        except TrainerError:
+            t.expected("replaced submodule rejected")
+        _full_md2["fusion_model"] = old_fm
+
+    except ImportError as e:
+        t.fail("trainer import", str(e)[:200])
+    except Exception as e:
+        t.fail("trainer contracts", str(e)[:200])
+
+
+# =============================================================================
 # Stage 9: Local Smoke Tests (optional subprocess)
 # =============================================================================
 
@@ -1117,6 +1328,7 @@ _SMOKE_FILES = [
     "training/optimizer.py",
     "training/scheduler.py",
     "training/evaluation.py",
+    "training/trainer.py",
 ]
 
 
@@ -1299,6 +1511,7 @@ def main():
     validate_pipeline(t, quick=quick)
     validate_models(t, quick=quick)
     validate_training_contracts(t)
+    validate_trainer_contracts(t)
     validate_smoke_tests(t, run_smoke=args.run_smoke)
 
     score = print_summary(t, print_json=args.json, json_out_path=args.json_out)
