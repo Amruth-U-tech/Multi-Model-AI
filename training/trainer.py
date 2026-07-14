@@ -36,7 +36,7 @@
 
 from __future__ import annotations
 
-import copy
+
 import datetime
 import logging
 import os
@@ -499,7 +499,9 @@ def _validate_loader_like(loader: Any, name: str) -> None:
     """Validate that a loader is an iterable, DataLoader-like object.
 
     Rejects None, scalars, strings, bytes, and plain dicts.
-    Calls iter() once without consuming data to verify iterability.
+    Calls iter(loader) to verify real iterability.
+    Preserves KeyboardInterrupt (not caught).
+    Wraps TypeError from iter() as TrainerError with from-chain.
     """
     if loader is None:
         raise TrainerError(
@@ -519,13 +521,31 @@ def _validate_loader_like(loader: Any, name: str) -> None:
             resolution="Pass a DataLoader, list of batch dicts, or iterable batch source.",
         )
 
-    # Verify iterability without consuming data or triggering __iter__ side effects
-    if not hasattr(loader, '__iter__'):
+    # Verify real iterability: call iter() and validate result
+    try:
+        it = iter(loader)
+    except TypeError as exc:
         raise TrainerError(
             "constructor", "validation", subsystem=name,
             received=type(loader).__name__,
             expected="iterable DataLoader-like object",
-            resolution="Pass a DataLoader, list of batch dicts, or iterable batch source.",
+            resolution="Object has no working __iter__. Pass a DataLoader or list.",
+        ) from exc
+    except Exception as exc:
+        raise TrainerError(
+            "constructor", "validation", subsystem=name,
+            received=f"{type(loader).__name__} (__iter__ raised {type(exc).__name__})",
+            expected="iterable DataLoader-like object",
+            resolution="Object __iter__ is broken. Pass a DataLoader or list.",
+        ) from exc
+
+    # iter() must return an object with __next__
+    if not hasattr(it, '__next__'):
+        raise TrainerError(
+            "constructor", "validation", subsystem=name,
+            received=f"iter() returned {type(it).__name__} without __next__",
+            expected="iterator with __next__",
+            resolution="Object __iter__ must return a valid iterator.",
         )
 
 
@@ -1153,7 +1173,95 @@ class Trainer:
                 resolution="DataLoader produced an empty batch.",
             )
 
-        # Ratings must be floating-point
+        # --- Tensor semantic checks ---
+
+        # images: must be floating-point and finite
+        images = batch["images"]
+        if not images.dtype.is_floating_point:
+            raise TrainerError(
+                "batch_validation", "BATCH_STARTED",
+                epoch=epoch, batch=batch_index,
+                subsystem="data_pipeline",
+                received=f"images.dtype={images.dtype}",
+                expected="floating-point dtype",
+                resolution="Cast images to float before collation.",
+            )
+        if not torch.isfinite(images).all():
+            raise TrainerError(
+                "batch_validation", "BATCH_STARTED",
+                epoch=epoch, batch=batch_index,
+                subsystem="data_pipeline",
+                received="images contain NaN or Inf",
+                expected="all finite values",
+                resolution="Check dataset for corrupt images.",
+            )
+
+        # tabular: must be floating-point and finite
+        tabular = batch["tabular"]
+        if not tabular.dtype.is_floating_point:
+            raise TrainerError(
+                "batch_validation", "BATCH_STARTED",
+                epoch=epoch, batch=batch_index,
+                subsystem="data_pipeline",
+                received=f"tabular.dtype={tabular.dtype}",
+                expected="floating-point dtype",
+                resolution="Cast tabular features to float before collation.",
+            )
+        if not torch.isfinite(tabular).all():
+            raise TrainerError(
+                "batch_validation", "BATCH_STARTED",
+                epoch=epoch, batch=batch_index,
+                subsystem="data_pipeline",
+                received="tabular contain NaN or Inf",
+                expected="all finite values",
+                resolution="Check dataset for corrupt tabular features.",
+            )
+
+        # input_ids: must be integer, non-bool, non-negative
+        input_ids = batch["input_ids"]
+        if input_ids.dtype == torch.bool or input_ids.dtype.is_floating_point or input_ids.dtype.is_complex:
+            raise TrainerError(
+                "batch_validation", "BATCH_STARTED",
+                epoch=epoch, batch=batch_index,
+                subsystem="data_pipeline",
+                received=f"input_ids.dtype={input_ids.dtype}",
+                expected="integer dtype (int32, int64)",
+                resolution="Cast input_ids to integer before collation.",
+            )
+        if (input_ids < 0).any():
+            raise TrainerError(
+                "batch_validation", "BATCH_STARTED",
+                epoch=epoch, batch=batch_index,
+                subsystem="data_pipeline",
+                received="input_ids contain negative values",
+                expected="all non-negative values",
+                resolution="Check tokenizer output for invalid input_ids.",
+            )
+
+        # attention_mask: must be integer or bool, binary values only
+        attn_mask = batch["attention_mask"]
+        if attn_mask.dtype.is_floating_point or attn_mask.dtype.is_complex:
+            raise TrainerError(
+                "batch_validation", "BATCH_STARTED",
+                epoch=epoch, batch=batch_index,
+                subsystem="data_pipeline",
+                received=f"attention_mask.dtype={attn_mask.dtype}",
+                expected="integer or bool dtype",
+                resolution="Cast attention_mask to integer or bool before collation.",
+            )
+        if attn_mask.dtype != torch.bool:
+            unique_vals = attn_mask.unique()
+            if not all(v.item() in (0, 1) for v in unique_vals):
+                raise TrainerError(
+                    "batch_validation", "BATCH_STARTED",
+                    epoch=epoch, batch=batch_index,
+                    subsystem="data_pipeline",
+                    received=f"attention_mask values: {unique_vals.tolist()[:10]}",
+                    expected="binary values (0 or 1)",
+                    resolution="Attention mask must contain only 0 and 1.",
+                )
+
+        # ratings: must be floating-point and finite
         ratings = batch["ratings"]
         if not ratings.dtype.is_floating_point:
             raise TrainerError(
@@ -1164,8 +1272,6 @@ class Trainer:
                 expected="floating-point dtype (float32, float64)",
                 resolution="Cast ratings to float before collation.",
             )
-
-        # Ratings must be finite
         if not torch.isfinite(ratings).all():
             raise TrainerError(
                 "batch_validation", "BATCH_STARTED",
@@ -1210,6 +1316,26 @@ class Trainer:
                 received=f"pred.device={predictions.device}, target.device={targets.device}",
                 expected="same device",
                 resolution="Prediction and target device mismatch.",
+            )
+
+        # Reject rank-0 (scalar) tensors
+        if predictions.dim() == 0:
+            raise TrainerError(
+                "prediction_validation", "FORWARD_COMPLETED",
+                epoch=epoch, batch=batch_index,
+                subsystem="fusion_model",
+                received=f"scalar prediction (shape={tuple(predictions.shape)})",
+                expected="[B] or [B,1]",
+                resolution="FusionModel returned a scalar instead of a batch.",
+            )
+        if targets.dim() == 0:
+            raise TrainerError(
+                "prediction_validation", "FORWARD_COMPLETED",
+                epoch=epoch, batch=batch_index,
+                subsystem="data_pipeline",
+                received=f"scalar target (shape={tuple(targets.shape)})",
+                expected="[B] or [B,1]",
+                resolution="Targets are scalar instead of a batch.",
             )
 
         pred_B = predictions.shape[0]
@@ -2273,6 +2399,79 @@ class Trainer:
                 resolution="Checkpoint version mismatch.",
             )
 
+        # Validate evaluator payload BEFORE any mutation (Phase 1 atomic gate)
+        self._validate_evaluator_payload(checkpoint)
+
+    def _validate_evaluator_payload(self, checkpoint: Dict[str, Any]) -> None:
+        """Validate evaluator state payload without mutation.
+
+        Called during Phase 1 contract validation to ensure evaluator
+        payload is well-formed before any state restoration occurs.
+        """
+        eval_payload = checkpoint.get("evaluation")
+        if not isinstance(eval_payload, dict):
+            raise TrainerError(
+                "resume", "contract_validation",
+                received=f"evaluation type={type(eval_payload).__name__}",
+                expected="dict",
+                resolution="Checkpoint 'evaluation' payload is missing or malformed.",
+            )
+        state_data = eval_payload.get("state")
+        if not isinstance(state_data, dict):
+            raise TrainerError(
+                "resume", "contract_validation",
+                received=f"evaluation.state type={type(state_data).__name__}",
+                expected="dict",
+                resolution="Checkpoint 'evaluation.state' is missing or malformed.",
+            )
+
+        # Field-level type rules (validation only, no assignment)
+        _NUMERIC_OR_NONE = ("best_validation_loss", "best_rmse", "best_mae", "best_r2", "latest_loss")
+        for field in _NUMERIC_OR_NONE:
+            if field in state_data:
+                v = state_data[field]
+                if v is not None and not isinstance(v, (int, float)):
+                    raise TrainerError(
+                        "resume", "contract_validation",
+                        received=f"{field} type={type(v).__name__}",
+                        expected="float, int, or None",
+                        resolution=f"Checkpoint evaluator state field '{field}' is corrupt.",
+                    )
+
+        _NONNEG_INT_OR_NONE = ("best_validation_epoch", "last_best_update_epoch")
+        for field in _NONNEG_INT_OR_NONE:
+            if field in state_data:
+                v = state_data[field]
+                if v is not None and (not isinstance(v, int) or v < 0):
+                    raise TrainerError(
+                        "resume", "contract_validation",
+                        received=f"{field}={v!r}",
+                        expected="non-negative int or None",
+                        resolution=f"Checkpoint evaluator state field '{field}' is corrupt.",
+                    )
+
+        _NONNEG_INT = ("epochs_without_improvement", "samples_evaluated", "batches_evaluated")
+        for field in _NONNEG_INT:
+            if field in state_data:
+                v = state_data[field]
+                if not isinstance(v, int) or v < 0:
+                    raise TrainerError(
+                        "resume", "contract_validation",
+                        received=f"{field}={v!r}",
+                        expected="non-negative int",
+                        resolution=f"Checkpoint evaluator state field '{field}' is corrupt.",
+                    )
+
+        if "latest_metrics" in state_data:
+            v = state_data["latest_metrics"]
+            if not isinstance(v, dict):
+                raise TrainerError(
+                    "resume", "contract_validation",
+                    received=f"latest_metrics type={type(v).__name__}",
+                    expected="dict",
+                    resolution="Checkpoint evaluator state field 'latest_metrics' is corrupt.",
+                )
+
     def _restore_checkpoint_state(self, checkpoint: Dict[str, Any]) -> None:
         """Phase 2 of two-phase resume: restore training state from checkpoint."""
         try:
@@ -2425,19 +2624,45 @@ class Trainer:
                 )
             es.last_best_update_epoch = v
         if "latest_loss" in state_data:
-            es.latest_loss = state_data["latest_loss"]
+            v = state_data["latest_loss"]
+            if v is not None and not isinstance(v, (int, float)):
+                raise TrainerError(
+                    "resume", "evaluator_restore",
+                    received=f"latest_loss type={type(v).__name__}",
+                    expected="float, int, or None",
+                    resolution="Checkpoint evaluator state is corrupt.",
+                )
+            es.latest_loss = v
         if "latest_metrics" in state_data:
             v = state_data["latest_metrics"]
-            if isinstance(v, dict):
-                es.latest_metrics = dict(v)
+            if not isinstance(v, dict):
+                raise TrainerError(
+                    "resume", "evaluator_restore",
+                    received=f"latest_metrics type={type(v).__name__}",
+                    expected="dict",
+                    resolution="Checkpoint evaluator state is corrupt.",
+                )
+            es.latest_metrics = dict(v)
         if "samples_evaluated" in state_data:
             v = state_data["samples_evaluated"]
-            if isinstance(v, int) and v >= 0:
-                es.samples_evaluated = v
+            if not isinstance(v, int) or v < 0:
+                raise TrainerError(
+                    "resume", "evaluator_restore",
+                    received=f"samples_evaluated={v!r}",
+                    expected="non-negative int",
+                    resolution="Checkpoint evaluator state is corrupt.",
+                )
+            es.samples_evaluated = v
         if "batches_evaluated" in state_data:
             v = state_data["batches_evaluated"]
-            if isinstance(v, int) and v >= 0:
-                es.batches_evaluated = v
+            if not isinstance(v, int) or v < 0:
+                raise TrainerError(
+                    "resume", "evaluator_restore",
+                    received=f"batches_evaluated={v!r}",
+                    expected="non-negative int",
+                    resolution="Checkpoint evaluator state is corrupt.",
+                )
+            es.batches_evaluated = v
 
     def _do_resume(self) -> None:
         """Execute the two-phase resume workflow.
@@ -3082,6 +3307,8 @@ if __name__ == "__main__":
 
     class _InterruptLoader:
         def __iter__(self):
+            return self
+        def __next__(self):
             raise KeyboardInterrupt
 
     t16 = build_trainer(
@@ -3445,6 +3672,198 @@ if __name__ == "__main__":
         check("None loader rejected", False)
     except TrainerError:
         check("None loader rejected", True)
+
+    # -- 40. Broken __iter__ loader rejected -----------------------------------
+    print("\n  40. Broken iter loader rejection...")
+    class _BrokenIter:
+        def __iter__(self):
+            raise ValueError("broken")
+    try:
+        _validate_loader_like(_BrokenIter(), "test_broken")
+        check("broken __iter__ rejected", False, "no error")
+    except TrainerError:
+        check("broken __iter__ rejected", True)
+
+    class _BadReturnIter:
+        def __iter__(self):
+            return 42  # not an iterator
+    try:
+        _validate_loader_like(_BadReturnIter(), "test_bad_return")
+        check("bad iter return rejected", False, "no error")
+    except TrainerError:
+        check("bad iter return rejected", True)
+
+    # -- 41. Scalar prediction rejected with TrainerError -----------------------
+    print("\n  41. Scalar prediction rejection...")
+    cfg41, ctx41, m41, o41, s41, e41 = _make_infra()
+    t41 = build_trainer(
+        config=cfg41, run_context=ctx41, model_bundle=m41,
+        optimizer=o41, scheduler=s41, evaluator=e41,
+        train_loader=_make_loader(1), render_dashboard=False,
+    )
+    scalar_pred = torch.tensor(3.14)
+    scalar_tgt = torch.tensor(2.0)
+    tgt_1d = torch.randn(4)
+    try:
+        t41._validate_prediction_contract(scalar_pred, tgt_1d, 1, 1)
+        check("scalar pred rejected", False, "no error")
+    except TrainerError:
+        check("scalar pred rejected", True)
+    except IndexError:
+        check("scalar pred rejected", False, "got raw IndexError instead of TrainerError")
+    try:
+        t41._validate_prediction_contract(torch.randn(4), scalar_tgt, 1, 1)
+        check("scalar target rejected", False, "no error")
+    except TrainerError:
+        check("scalar target rejected", True)
+
+    # -- 42. Batch semantic guards: images, tabular, input_ids, attention_mask --
+    print("\n  42. Batch tensor semantics...")
+    cfg42, ctx42, m42, o42, s42, e42 = _make_infra()
+    t42 = build_trainer(
+        config=cfg42, run_context=ctx42, model_bundle=m42,
+        optimizer=o42, scheduler=s42, evaluator=e42,
+        train_loader=_make_loader(1), render_dashboard=False,
+    )
+    def _good_batch():
+        return {
+            "images": torch.randn(2, 3, 4, 4),
+            "input_ids": torch.randint(0, 100, (2, 8)),
+            "attention_mask": torch.ones(2, 8, dtype=torch.long),
+            "tabular": torch.randn(2, 5),
+            "ratings": torch.randn(2),
+        }
+
+    # NaN images rejected
+    b_nan_img = _good_batch()
+    b_nan_img["images"][0, 0, 0, 0] = float('nan')
+    try:
+        t42._validate_batch(b_nan_img, 1, 1)
+        check("NaN image rejected", False, "no error")
+    except TrainerError:
+        check("NaN image rejected", True)
+
+    # Inf tabular rejected
+    b_inf_tab = _good_batch()
+    b_inf_tab["tabular"][0, 0] = float('inf')
+    try:
+        t42._validate_batch(b_inf_tab, 1, 1)
+        check("Inf tabular rejected", False, "no error")
+    except TrainerError:
+        check("Inf tabular rejected", True)
+
+    # float input_ids rejected
+    b_float_ids = _good_batch()
+    b_float_ids["input_ids"] = torch.randn(2, 8)
+    try:
+        t42._validate_batch(b_float_ids, 1, 1)
+        check("float input_ids rejected", False, "no error")
+    except TrainerError:
+        check("float input_ids rejected", True)
+
+    # negative input_ids rejected
+    b_neg_ids = _good_batch()
+    b_neg_ids["input_ids"] = torch.tensor([[-1, 2], [3, 4]])
+    try:
+        t42._validate_batch(b_neg_ids, 1, 1)
+        check("negative input_ids rejected", False, "no error")
+    except TrainerError:
+        check("negative input_ids rejected", True)
+
+    # non-binary attention_mask rejected
+    b_bad_mask = _good_batch()
+    b_bad_mask["attention_mask"] = torch.tensor([[0, 2], [1, 3]])
+    try:
+        t42._validate_batch(b_bad_mask, 1, 1)
+        check("non-binary mask rejected", False, "no error")
+    except TrainerError:
+        check("non-binary mask rejected", True)
+
+    # bool attention_mask accepted
+    b_bool_mask = _good_batch()
+    b_bool_mask["attention_mask"] = torch.ones(2, 8, dtype=torch.bool)
+    try:
+        t42._validate_batch(b_bool_mask, 1, 1)
+        check("bool mask accepted", True)
+    except TrainerError:
+        check("bool mask accepted", False)
+
+    # integer binary attention_mask accepted
+    b_int_mask = _good_batch()
+    b_int_mask["attention_mask"] = torch.tensor([[0, 1], [1, 0]])
+    try:
+        t42._validate_batch(b_int_mask, 1, 1)
+        check("int binary mask accepted", True)
+    except TrainerError:
+        check("int binary mask accepted", False)
+
+    # -- 43. Phase 1 evaluator payload rejection --------------------------------
+    print("\n  43. Phase 1 evaluator payload rejection...")
+    cfg43, ctx43, m43, o43, s43, e43 = _make_infra()
+    t43 = build_trainer(
+        config=cfg43, run_context=ctx43, model_bundle=m43,
+        optimizer=o43, scheduler=s43, evaluator=e43,
+        train_loader=_make_loader(1), render_dashboard=False,
+    )
+    # Phase 1 catches missing evaluation
+    try:
+        t43._validate_evaluator_payload({"no_eval": True})
+        check("Phase1 missing eval rejected", False, "no error")
+    except TrainerError:
+        check("Phase1 missing eval rejected", True)
+    # Phase 1 catches invalid counter
+    try:
+        t43._validate_evaluator_payload({
+            "evaluation": {"state": {"samples_evaluated": -5}}
+        })
+        check("Phase1 negative counter rejected", False, "no error")
+    except TrainerError:
+        check("Phase1 negative counter rejected", True)
+    # Phase 1 catches bad latest_metrics type
+    try:
+        t43._validate_evaluator_payload({
+            "evaluation": {"state": {"latest_metrics": "not_a_dict"}}
+        })
+        check("Phase1 bad latest_metrics rejected", False, "no error")
+    except TrainerError:
+        check("Phase1 bad latest_metrics rejected", True)
+
+    # -- 44. Strict evaluator restore rejects bad latest_loss -------------------
+    print("\n  44. Strict evaluator restore fields...")
+    cfg44, ctx44, m44, o44, s44, e44 = _make_infra()
+    t44 = build_trainer(
+        config=cfg44, run_context=ctx44, model_bundle=m44,
+        optimizer=o44, scheduler=s44, evaluator=e44,
+        train_loader=_make_loader(1), render_dashboard=False,
+    )
+    try:
+        t44._restore_evaluator_state({
+            "evaluation": {"state": {"latest_loss": "bad"}}
+        })
+        check("bad latest_loss rejected", False, "no error")
+    except TrainerError:
+        check("bad latest_loss rejected", True)
+    try:
+        t44._restore_evaluator_state({
+            "evaluation": {"state": {"latest_metrics": [1, 2]}}
+        })
+        check("bad latest_metrics rejected", False, "no error")
+    except TrainerError:
+        check("bad latest_metrics rejected", True)
+    try:
+        t44._restore_evaluator_state({
+            "evaluation": {"state": {"samples_evaluated": -1}}
+        })
+        check("negative samples_evaluated rejected", False, "no error")
+    except TrainerError:
+        check("negative samples_evaluated rejected", True)
+    try:
+        t44._restore_evaluator_state({
+            "evaluation": {"state": {"batches_evaluated": -3}}
+        })
+        check("negative batches_evaluated rejected", False, "no error")
+    except TrainerError:
+        check("negative batches_evaluated rejected", True)
 
     # -- Final -----------------------------------------------------------------
     total = passed + failed

@@ -1302,6 +1302,88 @@ def validate_trainer_contracts(t: ValidationTracker):
             t.expected("replaced submodule rejected")
         _full_md2["fusion_model"] = old_fm
 
+        # Broken iterable-like loader rejected
+        class _VBrokenIter:
+            def __iter__(self):
+                raise ValueError("broken")
+        try:
+            _validate_loader_like(_VBrokenIter(), "test")
+            t.fail("broken iterable rejected", "should have raised")
+        except TrainerError:
+            t.expected("broken iterable rejected")
+
+        # Scalar prediction rejected
+        import torch
+        scalar_p = torch.tensor(3.14)
+        tgt_1d = torch.randn(4)
+        try:
+            _tr._validate_prediction_contract(scalar_p, tgt_1d, 1, 1)
+            t.fail("scalar prediction rejected", "should have raised")
+        except TrainerError:
+            t.expected("scalar prediction rejected")
+
+        # _validate_evaluator_payload exists and works
+        t.check("Trainer._validate_evaluator_payload exists",
+                hasattr(Trainer, "_validate_evaluator_payload"))
+        try:
+            _tr._validate_evaluator_payload({"no_eval": True})
+            t.fail("Phase1 eval payload rejected", "should have raised")
+        except TrainerError:
+            t.expected("Phase1 eval payload rejected")
+        try:
+            _tr._validate_evaluator_payload({
+                "evaluation": {"state": {"samples_evaluated": -1}}
+            })
+            t.fail("Phase1 eval counter rejected", "should have raised")
+        except TrainerError:
+            t.expected("Phase1 eval counter rejected")
+
+        # Batch semantic guards exist: NaN image
+        good_batch = {
+            "images": torch.randn(2, 3, 2, 2),
+            "input_ids": torch.randint(0, 10, (2, 4)),
+            "attention_mask": torch.ones(2, 4, dtype=torch.long),
+            "tabular": torch.randn(2, 3),
+            "ratings": torch.randn(2),
+        }
+        nan_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                     for k, v in good_batch.items()}
+        nan_batch["images"][0, 0, 0, 0] = float('nan')
+        try:
+            _tr._validate_batch(nan_batch, 1, 1)
+            t.fail("NaN image rejected", "should have raised")
+        except TrainerError:
+            t.expected("NaN image rejected")
+
+        # float input_ids rejected
+        bad_ids_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                        for k, v in good_batch.items()}
+        bad_ids_batch["input_ids"] = torch.randn(2, 4)
+        try:
+            _tr._validate_batch(bad_ids_batch, 1, 1)
+            t.fail("float input_ids rejected", "should have raised")
+        except TrainerError:
+            t.expected("float input_ids rejected")
+
+        # bool attention_mask accepted
+        bool_mask_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                          for k, v in good_batch.items()}
+        bool_mask_batch["attention_mask"] = torch.ones(2, 4, dtype=torch.bool)
+        try:
+            _tr._validate_batch(bool_mask_batch, 1, 1)
+            t.check("bool attention_mask accepted", True)
+        except TrainerError:
+            t.fail("bool attention_mask accepted", "unexpectedly rejected")
+
+        # Strict evaluator restore rejects bad latest_loss
+        try:
+            _tr._restore_evaluator_state({
+                "evaluation": {"state": {"latest_loss": "bad"}}
+            })
+            t.fail("bad latest_loss rejected", "should have raised")
+        except TrainerError:
+            t.expected("bad latest_loss rejected")
+
     except ImportError as e:
         t.fail("trainer import", str(e)[:200])
     except Exception as e:
