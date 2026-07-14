@@ -2244,11 +2244,9 @@ class Trainer:
             os.close(fd)
             torch.save(checkpoint, tmp_path)
 
-            # Atomic replace
-            tmp_path_obj = Path(tmp_path)
-            if ckpt_path.exists():
-                ckpt_path.unlink()
-            tmp_path_obj.rename(ckpt_path)
+            # Atomic replace: os.replace atomically overwrites target
+            os.replace(tmp_path, str(ckpt_path))
+            tmp_path = None  # replacement succeeded, no cleanup needed
 
         except Exception as exc:
             # Clean up temp file on failure -- guard against tmp_path being None
@@ -3864,6 +3862,48 @@ if __name__ == "__main__":
         check("negative batches_evaluated rejected", False, "no error")
     except TrainerError:
         check("negative batches_evaluated rejected", True)
+
+    # -- 45. Checkpoint atomicity: failed save preserves old checkpoint ----------
+    print("\n  45. Checkpoint atomicity...")
+    with tempfile.TemporaryDirectory() as tmpdir45:
+        cfg45, ctx45, m45, o45, s45, e45 = _make_infra(save_latest=True)
+        t45 = build_trainer(
+            config=cfg45, run_context=ctx45, model_bundle=m45,
+            optimizer=o45, scheduler=s45, evaluator=e45,
+            train_loader=_make_loader(1), render_dashboard=False,
+        )
+        t45._checkpoint_dir = Path(tmpdir45)
+        t45._capture_reproducibility()
+        t45._prepare_model()
+        t45._set_status(_TrainerStatus.RUNNING)
+        t45._runtime.global_step = 10
+        t45._runtime.current_epoch = 1
+
+        # Save a valid old checkpoint
+        t45._save_checkpoint("latest", 1)
+        ckpt45 = Path(tmpdir45) / "latest.pt"
+        check("old ckpt exists", ckpt45.exists())
+        old_bytes = ckpt45.read_bytes()
+        old_count = t45._checkpoint_state.checkpoint_count
+
+        # Monkeypatch os.replace to fail
+        _orig_replace = os.replace
+        def _fail_replace(src, dst):
+            raise OSError("simulated disk failure")
+        os.replace = _fail_replace
+        try:
+            t45._runtime.global_step = 20
+            t45._save_checkpoint("latest", 2)
+            check("failed save raised TrainerError", False, "no error")
+        except TrainerError:
+            check("failed save raised TrainerError", True)
+        finally:
+            os.replace = _orig_replace
+
+        # Old checkpoint must survive
+        check("old ckpt survives", ckpt45.exists())
+        check("old ckpt unchanged", ckpt45.read_bytes() == old_bytes)
+        check("ckpt count not advanced", t45._checkpoint_state.checkpoint_count == old_count)
 
     # -- Final -----------------------------------------------------------------
     total = passed + failed

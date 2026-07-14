@@ -1384,6 +1384,14 @@ def validate_trainer_contracts(t: ValidationTracker):
         except TrainerError:
             t.expected("bad latest_loss rejected")
 
+        # Checkpoint atomicity: no unsafe unlink+rename pattern
+        import inspect as _vinsp
+        _save_src = _vinsp.getsource(Trainer._save_checkpoint)
+        t.check("no .unlink() in _save_checkpoint",
+                ".unlink()" not in _save_src)
+        t.check("os.replace used in _save_checkpoint",
+                "os.replace" in _save_src)
+
     except ImportError as e:
         t.fail("trainer import", str(e)[:200])
     except Exception as e:
