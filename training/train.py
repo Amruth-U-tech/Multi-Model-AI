@@ -1892,3 +1892,4 @@ def run_smoke_tests() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+    #the complete training comes to life
