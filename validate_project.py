@@ -593,10 +593,96 @@ def validate_training_contracts(t: ValidationTracker):
         d = cfg2.as_dict()
         t.check("as_dict returns dict", isinstance(d, dict) and "epochs" in d)
 
+        # New fields: validation_split, train_all, train_datasets
+        t.check("has validation_split", hasattr(cfg2, "validation_split"))
+        t.check("validation_split default", 0.0 < cfg2.validation_split < 1.0)
+        t.check("has train_all", hasattr(cfg2, "train_all"))
+        t.check("has train_datasets", hasattr(cfg2, "train_datasets"))
+        t.check("train_datasets is tuple", isinstance(cfg2.train_datasets, tuple))
+
+        # Reject bad validation_split
+        try:
+            TrainConfig(validation_split=0.0).validate()
+            t.fail("val_split=0 rejected", "should have raised")
+        except TrainConfigError:
+            t.expected("val_split=0 rejected")
+
     except ImportError as e:
         t.fail("TrainConfig import", str(e)[:200])
     except Exception as e:
         t.fail("training contracts", str(e)[:200])
+
+    # -- train.py bootloader checks --------------------------------------------
+    try:
+        from training.train import (
+            TrainAppError, build_execution_plan, run_training,
+            print_execution_plan, main, MANIFEST_SCHEMA_VERSION,
+            perform_preflight, perform_dry_run, write_run_manifest,
+            run_smoke_tests, _build_split,
+            EXIT_SUCCESS, EXIT_INTERRUPT,
+        )
+        t.check("training.train imports", True)
+        t.check("TrainAppError is RuntimeError", issubclass(TrainAppError, RuntimeError))
+        t.check("build_execution_plan callable", callable(build_execution_plan))
+        t.check("run_training callable", callable(run_training))
+        t.check("print_execution_plan callable", callable(print_execution_plan))
+        t.check("main callable", callable(main))
+        t.check("MANIFEST_SCHEMA_VERSION >= 1", MANIFEST_SCHEMA_VERSION >= 1)
+        # Part 3 APIs
+        t.check("perform_preflight callable", callable(perform_preflight))
+        t.check("perform_dry_run callable", callable(perform_dry_run))
+        t.check("write_run_manifest callable", callable(write_run_manifest))
+        t.check("run_smoke_tests callable", callable(run_smoke_tests))
+        t.check("EXIT_SUCCESS = 0", EXIT_SUCCESS == 0)
+        t.check("EXIT_INTERRUPT = 130", EXIT_INTERRUPT == 130)
+        # Split integrity uses TrainAppError, not assert
+        import inspect as _vi
+        _split_src = _vi.getsource(_build_split)
+        t.check("split no raw assert", "assert " not in _split_src)
+        t.check("split uses TrainAppError", "TrainAppError" in _split_src)
+        # Dry run delegates to Trainer
+        _dr_src = _vi.getsource(perform_dry_run)
+        t.check("dry_run no .to(device)", ".to(device)" not in _dr_src)
+        t.check("dry_run delegates to trainer", "dry_run_batch" in _dr_src)
+        # Manifest atomic
+        _mw_src = _vi.getsource(write_run_manifest)
+        t.check("manifest atomic (os.replace)", "os.replace" in _mw_src)
+        t.check("manifest atomic (fsync)", "os.fsync" in _mw_src)
+        # Preflight validates topology
+        _pf_src = _vi.getsource(perform_preflight)
+        t.check("preflight checks overlap", "overlap" in _pf_src.lower() or "&" in _pf_src)
+        t.check("preflight can fail", '"failed"' in _pf_src)
+        # Trainer.dry_run_batch exists
+        from training.trainer import Trainer
+        t.check("Trainer.dry_run_batch", hasattr(Trainer, "dry_run_batch"))
+        # Dataset has no _torch (pickle safety)
+        from data_pipeline.dataset import MultimodalProductDataset
+        t.check("dataset no _torch attr", "_torch" not in MultimodalProductDataset.__init__.__code__.co_varnames)
+        # run_training checks preflight failed
+        _rt_src = _vi.getsource(run_training)
+        t.check("run_training aborts on preflight fail", 'pf.status == "failed"' in _rt_src)
+        # manifest mkdir inside try
+        t.check("manifest mkdir inside try", "manifest_dir.mkdir" not in _mw_src.split("try:")[0] if "try:" in _mw_src else False)
+        # tabular input dim contract
+        t.check("model_bundle accepts tabular_input_dim", "tabular_input_dim" in _vi.getsource(build_execution_plan))
+        # validation_dataset_name guard
+        _sel_src = _vi.getsource(run_training).replace(" ", "")  # rough check
+        t.check("validation_dataset_name not ignored",
+                "validation_dataset_name" in _vi.getsource(build_execution_plan) or
+                "validation_dataset_name" in open(str(Path(__file__).parent / "training" / "train.py"), encoding="utf-8").read().split("def _select_datasets")[1].split("def ")[0])
+        # worker init picklable
+        import pickle as _pkl
+        from data_pipeline.dataloader_factory import make_worker_init_fn as _mwif
+        _wfn = _mwif(42)
+        try:
+            _pkl.dumps(_wfn)
+            t.check("worker_init_fn picklable", True)
+        except Exception:
+            t.check("worker_init_fn picklable", False)
+    except ImportError as e:
+        t.fail("training.train import", str(e)[:200])
+    except Exception as e:
+        t.fail("training.train contracts", str(e)[:200])
 
     # -- RunContext checks -----------------------------------------------------
     try:

@@ -34,7 +34,7 @@ import logging
 from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Optional, Set, FrozenSet
+from typing import Any, Dict, List, Optional, Sequence, Set, FrozenSet, Tuple, Union
 
 # -- Project root bootstrap ----------------------------------------------------
 _THIS_DIR = Path(__file__).resolve().parent
@@ -138,6 +138,11 @@ class TrainConfig:
     validation_dataset_name: Optional[str] = None
     num_workers: Optional[int] = None
 
+    # -- Dataset Selection & Splitting -----------------------------------------
+    validation_split: float = 0.2
+    train_all: bool = False
+    train_datasets: Tuple[str, ...] = ()
+
     # -- Training --------------------------------------------------------------
     epochs: int = 50
     batch_size: int = 16
@@ -219,6 +224,15 @@ class TrainConfig:
             self.validation_dataset_name = self.validation_dataset_name.strip() or None
         if isinstance(self.resume_checkpoint, str):
             self.resume_checkpoint = self.resume_checkpoint.strip() or None
+
+        # Normalize train_datasets: accept list/tuple of strings -> tuple of stripped strings
+        if isinstance(self.train_datasets, (list, tuple)):
+            self.train_datasets = tuple(
+                s.strip() if isinstance(s, str) else s
+                for s in self.train_datasets
+            )
+        elif isinstance(self.train_datasets, str):
+            self.train_datasets = (self.train_datasets.strip(),) if self.train_datasets.strip() else ()
 
     # -- Validation ------------------------------------------------------------
 
@@ -355,10 +369,41 @@ class TrainConfig:
 
         # -- Booleans ----------------------------------------------------------
         for bname in ("save_best", "save_latest", "resume", "mixed_precision",
-                      "deterministic"):
+                      "deterministic", "train_all"):
             val = getattr(self, bname)
             if not isinstance(val, bool):
                 raise self._err(bname, val, "bool")
+
+        # -- validation_split --------------------------------------------------
+        if isinstance(self.validation_split, bool):
+            raise self._err("validation_split", self.validation_split,
+                            "float in (0.0, 1.0), not bool")
+        if not isinstance(self.validation_split, (int, float)):
+            raise self._err("validation_split", self.validation_split,
+                            "float in (0.0, 1.0)")
+        if math.isnan(self.validation_split) or math.isinf(self.validation_split):
+            raise self._err("validation_split", self.validation_split,
+                            "finite float in (0.0, 1.0)")
+        if not (0.0 < self.validation_split < 1.0):
+            raise self._err("validation_split", self.validation_split,
+                            "0.0 < validation_split < 1.0",
+                            "Typical values: 0.1, 0.15, 0.2")
+
+        # -- train_datasets ----------------------------------------------------
+        if not isinstance(self.train_datasets, (tuple, list)):
+            raise self._err("train_datasets", self.train_datasets,
+                            "tuple or list of non-empty strings")
+        for i, name in enumerate(self.train_datasets):
+            if not isinstance(name, str) or not name.strip():
+                raise self._err("train_datasets", self.train_datasets,
+                                f"all entries must be non-empty strings (index {i})")
+        # Reject duplicates
+        seen = set()
+        for name in self.train_datasets:
+            if name in seen:
+                raise self._err("train_datasets", self.train_datasets,
+                                f"no duplicate entries (duplicate: '{name}')")
+            seen.add(name)
 
         # -- Log level ---------------------------------------------------------
         valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
@@ -507,6 +552,9 @@ class TrainConfig:
             f"  State            : {self._state.value}",
             f"  Experiment       : {self.experiment_name}",
             f"  Dataset          : {self.dataset_name}",
+            f"  Train All        : {self.train_all}",
+            f"  Train Datasets   : {self.train_datasets if self.train_datasets else '(default)'}",
+            f"  Val Split        : {self.validation_split}",
             f"  Epochs           : {self.epochs}",
             f"  Batch Size       : {self.batch_size}",
             f"  Optimizer        : {self.optimizer} (lr={self.learning_rate})",
@@ -792,6 +840,59 @@ if __name__ == "__main__":
                  lambda: TrainConfig(validation_dataset_name=True).validate())
     expect_error("val_ds list", TrainConfigError,
                  lambda: TrainConfig(validation_dataset_name=[]).validate())
+
+    # -- 17. validation_split --------------------------------------------------
+    print("\n  17. validation_split...")
+    vs1 = TrainConfig(validation_split=0.15)
+    vs1.validate()
+    check("val_split 0.15 accepted", vs1.validation_split == 0.15)
+    expect_error("val_split=0", TrainConfigError,
+                 lambda: TrainConfig(validation_split=0.0).validate())
+    expect_error("val_split=1", TrainConfigError,
+                 lambda: TrainConfig(validation_split=1.0).validate())
+    expect_error("val_split=-0.1", TrainConfigError,
+                 lambda: TrainConfig(validation_split=-0.1).validate())
+    expect_error("val_split=True", TrainConfigError,
+                 lambda: TrainConfig(validation_split=True).validate())
+    expect_error("val_split=NaN", TrainConfigError,
+                 lambda: TrainConfig(validation_split=float('nan')).validate())
+    expect_error("val_split='0.2'", TrainConfigError,
+                 lambda: TrainConfig(validation_split='0.2').validate())
+
+    # -- 18. train_all + train_datasets ----------------------------------------
+    print("\n  18. train_all + train_datasets...")
+    ta1 = TrainConfig(train_all=True)
+    ta1.validate()
+    check("train_all=True accepted", ta1.train_all is True)
+    td1 = TrainConfig(train_datasets=("ds1", "ds2"))
+    td1.validate()
+    check("train_datasets accepted", td1.train_datasets == ("ds1", "ds2"))
+    # List normalizes to tuple
+    td2 = TrainConfig(train_datasets=[" ds1 ", "ds2"])
+    td2.validate()
+    check("list normalizes to tuple", td2.train_datasets == ("ds1", "ds2"))
+    # Duplicates rejected
+    expect_error("duplicate train_datasets", TrainConfigError,
+                 lambda: TrainConfig(train_datasets=("a", "b", "a")).validate())
+    # Non-string entry
+    expect_error("non-string train_datasets", TrainConfigError,
+                 lambda: TrainConfig(train_datasets=(123,)).validate())
+    # Empty string entry
+    expect_error("empty string train_datasets", TrainConfigError,
+                 lambda: TrainConfig(train_datasets=("",)).validate())
+    expect_error("train_all=1 (non-bool)", TrainConfigError,
+                 lambda: TrainConfig(train_all=1).validate())
+
+    # -- 19. New fields in summary + as_dict -----------------------------------
+    print("\n  19. New fields in summary/as_dict...")
+    tc19 = build_train_config(train_all=True, train_datasets=("x",))
+    s19 = tc19.summary()
+    check("summary has Val Split", "Val Split" in s19)
+    check("summary has Train All", "Train All" in s19)
+    d19 = tc19.as_dict()
+    check("as_dict has validation_split", "validation_split" in d19)
+    check("as_dict has train_all", "train_all" in d19)
+    check("as_dict has train_datasets", "train_datasets" in d19)
 
     # -- Final -----------------------------------------------------------------
     total = passed + failed

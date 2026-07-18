@@ -499,9 +499,18 @@ def _validate_loader_like(loader: Any, name: str) -> None:
     """Validate that a loader is an iterable, DataLoader-like object.
 
     Rejects None, scalars, strings, bytes, and plain dicts.
-    Calls iter(loader) to verify real iterability.
+
+    For PyTorch DataLoaders: validates structurally only (has dataset,
+    batch_size or batch_sampler, collate_fn). Does NOT call iter(loader)
+    because that starts worker processes on Windows/Colab.
+
+    For simple safe iterables (list, tuple): accepted structurally.
+
+    For custom iterable objects: calls iter() to verify, since custom
+    objects do not start worker processes.
+
     Preserves KeyboardInterrupt (not caught).
-    Wraps TypeError from iter() as TrainerError with from-chain.
+    Wraps validation failures as TrainerError with from-chain.
     """
     if loader is None:
         raise TrainerError(
@@ -521,7 +530,40 @@ def _validate_loader_like(loader: Any, name: str) -> None:
             resolution="Pass a DataLoader, list of batch dicts, or iterable batch source.",
         )
 
-    # Verify real iterability: call iter() and validate result
+    # PyTorch DataLoader: structural validation only, no iter()
+    _DL = getattr(torch.utils.data, "DataLoader", None)
+    if _DL is not None and isinstance(loader, _DL):
+        if not hasattr(loader, "dataset"):
+            raise TrainerError(
+                "constructor", "validation", subsystem=name,
+                received="DataLoader without .dataset",
+                expected="DataLoader with valid dataset",
+                resolution="Construct DataLoader with a valid dataset.",
+            )
+        has_batch_config = (
+            hasattr(loader, "batch_size") or hasattr(loader, "batch_sampler")
+        )
+        if not has_batch_config:
+            raise TrainerError(
+                "constructor", "validation", subsystem=name,
+                received="DataLoader without batch_size or batch_sampler",
+                expected="DataLoader with batching config",
+                resolution="Construct DataLoader with batch_size or batch_sampler.",
+            )
+        if not hasattr(loader, "collate_fn"):
+            raise TrainerError(
+                "constructor", "validation", subsystem=name,
+                received="DataLoader without .collate_fn",
+                expected="DataLoader with collate_fn",
+                resolution="Construct DataLoader with a collate_fn.",
+            )
+        return  # Structurally valid DataLoader, do not iter()
+
+    # Safe built-in iterables: accept without iter()
+    if isinstance(loader, (list, tuple)):
+        return
+
+    # Custom iterable objects: call iter() to verify
     try:
         it = iter(loader)
     except TypeError as exc:
@@ -1550,6 +1592,54 @@ class Trainer:
             )
 
         return model_output
+
+    def dry_run_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Trainer-owned one-batch diagnostic. Validates batch, device,
+        forward, prediction, and loss contracts without mutating:
+        history, epoch, step, best metric, optimizer state, scheduler
+        state, or checkpoint state.
+
+        Returns lightweight diagnostics dict.
+        """
+        was_training = self._model_bundle.training
+        try:
+            self._model_bundle.eval()
+
+            # 1. Validate batch structure
+            self._validate_batch(batch, 0, 0)
+
+            # 2. Move to device through Trainer-owned transfer
+            batch = self._move_batch_to_device(batch)
+            self._validate_batch_device(batch, 0, 0)
+
+            # 3. Forward pass with no_grad
+            with torch.no_grad():
+                model_output = self._forward_batch(batch)
+                predictions = extract_prediction(model_output)
+                targets = batch["ratings"]
+                self._validate_prediction_contract(predictions, targets, 0, 0)
+                loss = compute_loss(predictions, targets, self._config)
+
+            loss_value = loss.item()
+            loss_finite = torch.isfinite(loss).item()
+
+            return {
+                "forward_ok": True,
+                "loss_ok": loss_finite,
+                "loss_value": loss_value if loss_finite else None,
+                "prediction_shape": list(predictions.shape),
+                "target_shape": list(targets.shape),
+                "device": str(predictions.device),
+            }
+        except Exception as exc:
+            return {
+                "forward_ok": False,
+                "loss_ok": False,
+                "error": str(exc)[:300],
+                "error_type": type(exc).__name__,
+            }
+        finally:
+            self._model_bundle.train(was_training)
 
     def _train_one_batch(
         self,
@@ -3690,6 +3780,35 @@ if __name__ == "__main__":
         check("bad iter return rejected", False, "no error")
     except TrainerError:
         check("bad iter return rejected", True)
+
+    # Real PyTorch DataLoader accepted without consuming a batch
+    from torch.utils.data import DataLoader as _DL, TensorDataset as _TDS
+    _test_ds = _TDS(torch.randn(4, 3))
+    _test_dl = _DL(_test_ds, batch_size=2, num_workers=0)
+    try:
+        _validate_loader_like(_test_dl, "test_real_dl")
+        check("real DataLoader accepted", True)
+    except TrainerError:
+        check("real DataLoader accepted", False, "rejected")
+
+    # dict still rejected
+    try:
+        _validate_loader_like({"a": 1}, "test_dict")
+        check("dict loader rejected", False)
+    except TrainerError:
+        check("dict loader rejected", True)
+
+    # str still rejected
+    try:
+        _validate_loader_like("hello", "test_str")
+        check("string loader rejected", False)
+    except TrainerError:
+        check("string loader rejected", True)
+
+    # 40b. dry_run_batch exists on Trainer
+    print("\n  40b. Trainer.dry_run_batch exists...")
+    check("Trainer.dry_run_batch exists", hasattr(Trainer, "dry_run_batch"))
+    check("dry_run_batch callable", callable(getattr(Trainer, "dry_run_batch", None)))
 
     # -- 41. Scalar prediction rejected with TrainerError -----------------------
     print("\n  41. Scalar prediction rejection...")

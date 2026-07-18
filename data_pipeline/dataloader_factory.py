@@ -394,10 +394,20 @@ def analyze_worker_risk(
 # 7. Worker init function
 # =============================================================================
 
-def make_worker_init_fn(seed: int):
-    """Create a deterministic worker init function for reproducibility."""
-    def _worker_init_fn(worker_id: int) -> None:
-        worker_seed = seed + worker_id
+@dataclass(frozen=True)
+class _WorkerSeedInitializer:
+    """Picklable worker init callable for DataLoader multiprocessing."""
+    seed: int
+
+    def __post_init__(self):
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise TypeError(
+                f"_WorkerSeedInitializer.seed must be int, "
+                f"got {type(self.seed).__name__}: {self.seed!r}"
+            )
+
+    def __call__(self, worker_id: int) -> None:
+        worker_seed = self.seed + worker_id
         random.seed(worker_seed)
         torch.manual_seed(worker_seed)
         try:
@@ -405,7 +415,11 @@ def make_worker_init_fn(seed: int):
             np.random.seed(worker_seed % (2**32))
         except ImportError:
             pass
-    return _worker_init_fn
+
+
+def make_worker_init_fn(seed: int):
+    """Create a deterministic, picklable worker init function."""
+    return _WorkerSeedInitializer(seed)
 
 
 # =============================================================================
@@ -1031,6 +1045,20 @@ if __name__ == "__main__":
         chk("no from models", "from models" not in pc)
         chk("no from train", "from train" not in pc)
         chk("no BatchCollator import", "BatchCollator" not in prod.split("from data_pipeline.collate")[1].split("\n")[0] if "from data_pipeline.collate" in prod else True)
+
+        # ---- 11. Worker init pickle safety ----
+        print("\n  11. Worker init pickle safety...")
+        import pickle
+        fn = make_worker_init_fn(42)
+        chk("worker_init callable", callable(fn))
+        try:
+            pickle.dumps(fn)
+            chk("worker_init picklable", True)
+        except Exception:
+            chk("worker_init picklable", False)
+        fn(0)  # Should not raise
+        chk("worker_init runs ok", True)
+        chk("no nested _worker_init_fn", "def _worker_init_fn" not in prod)
 
         # ---- Summary ----
         print(f"\n{'='*60}")

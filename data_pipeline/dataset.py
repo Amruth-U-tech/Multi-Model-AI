@@ -369,7 +369,6 @@ class MultimodalProductDataset(_torch_data.Dataset):
         if config is None:
             config = DatasetConfig()
         self.config = config
-        self._torch = torch
 
         # -- Route CSV source --------------------------------------------------
         # Priority: source_files > dataset_name > csv_filename
@@ -693,7 +692,7 @@ class MultimodalProductDataset(_torch_data.Dataset):
             debug_trace  : Override config.debug_trace if not None.
             enable_timing: Override config.enable_timing if not None.
         """
-        torch = self._torch
+        import torch
         cfg = self.config
         do_trace = debug_trace if debug_trace is not None else cfg.debug_trace
         do_timing = enable_timing if enable_timing is not None else cfg.enable_timing
@@ -1265,6 +1264,33 @@ if __name__ == "__main__":
         chk("whitespace is missing", _is_missing_text("   "))
         chk("real text not missing", not _is_missing_text("hello"))
         chk("literal nan not missing", not _is_missing_text("nan"))
+
+        # -- 12. Pickle safety (multiprocessing) ---------------------------
+        print("\n  12. Pickle safety...")
+        import pickle
+        from torch.utils.data import Subset, DataLoader, TensorDataset
+        try:
+            pickle.dumps(ds)
+            chk("dataset picklable", True)
+        except Exception as e:
+            chk("dataset picklable", False)
+        try:
+            pickle.dumps(Subset(ds, [0]))
+            chk("subset picklable", True)
+        except Exception as e:
+            chk("subset picklable", False)
+
+        # -- 13. DataLoader worker test ------------------------------------
+        print("\n  13. DataLoader worker retrieval...")
+        try:
+            _tiny_dl = DataLoader(
+                Subset(ds, list(range(min(2, len(ds))))),
+                batch_size=1, num_workers=0,
+            )
+            _b = next(iter(_tiny_dl))
+            chk("loader yields batch", isinstance(_b, dict))
+        except Exception as e:
+            chk("loader yields batch", False)
 
         # -- Summary -------------------------------------------------------
         print(f"\n{'='*60}")
