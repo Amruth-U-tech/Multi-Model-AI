@@ -830,16 +830,17 @@ class Trainer:
         try:
             self._validate_ready_state()
 
-            # Resume if requested
-            if self._config.resume:
-                self._do_resume()
-
             # Capture reproducibility snapshot
             self._capture_reproducibility()
 
-            # Prepare model and AMP
+            # Prepare model and AMP before resume so checkpoint state
+            # loads onto the correct device and scaler exists for restore.
             self._prepare_model()
             self._prepare_amp()
+
+            # Resume if requested (after model/AMP are on device)
+            if self._config.resume:
+                self._do_resume()
 
             # Begin training
             self._train_start_time = time.perf_counter()
@@ -1018,8 +1019,10 @@ class Trainer:
         )
 
     def _prepare_model(self) -> None:
-        """Move model bundle to the target device."""
-        device = torch.device(self._run_context.device)
+        """Move model bundle to the target device. Idempotent."""
+        if getattr(self, '_model_prepared', False):
+            return
+        device = self._expected_runtime_device()
         self._model_bundle.to(device)
 
         # Warn if model has zero trainable parameters
@@ -1031,16 +1034,18 @@ class Trainer:
                 "Model has zero trainable parameters. "
                 "Training will proceed but weights will not update."
             )
+        self._model_prepared = True
 
     def _prepare_amp(self) -> None:
         """Prepare AMP GradScaler if mixed precision is available and requested.
 
-        Determines AMP capability once at initialization. Stores the chosen
-        implementation for the entire run. Never branches on PyTorch version
-        during the training loop.
+        Idempotent: only initializes once. Stores the chosen implementation
+        for the entire run. Never branches on PyTorch version during training.
 
         Records fallback reason when AMP is requested but unavailable.
         """
+        if getattr(self, '_amp_prepared', False):
+            return
         if (self._run_context.mixed_precision_requested
                 and self._run_context.mixed_precision_available):
             self._amp_enabled = True
@@ -1065,6 +1070,7 @@ class Trainer:
             else:
                 self._runtime.amp_status = "disabled"
                 self._runtime.amp_fallback_reason = None
+        self._amp_prepared = True
 
     # =========================================================================
     # Internal -- Event / State Machine
@@ -1434,12 +1440,24 @@ class Trainer:
                 resolution="Check model output for numerical instability.",
             )
 
+    def _expected_runtime_device(self) -> torch.device:
+        """Canonicalize device intent to concrete runtime device.
+
+        'cuda' -> torch.device('cuda', torch.cuda.current_device()) on CUDA runtime.
+        'cpu'  -> torch.device('cpu').
+        Explicit 'cuda:N' -> torch.device('cuda', N).
+        """
+        d = torch.device(self._run_context.device)
+        if d.type == "cuda" and d.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+        return d
+
     def _validate_model_device(self) -> None:
         """Validate every model parameter and buffer is on the expected device.
 
         Stops immediately on first mismatch for deterministic errors.
         """
-        expected_device = torch.device(self._run_context.device)
+        expected_device = self._expected_runtime_device()
         # Check all parameters
         for name, param in self._model_bundle.named_parameters():
             if param.device != expected_device:
@@ -1465,7 +1483,7 @@ class Trainer:
         self, batch: Dict[str, Any], epoch: int, batch_index: int,
     ) -> None:
         """Verify batch tensors are on the expected device after transfer."""
-        expected_device = torch.device(self._run_context.device)
+        expected_device = self._expected_runtime_device()
         for key in _TENSOR_BATCH_KEYS:
             val = batch.get(key)
             if isinstance(val, torch.Tensor) and val.device != expected_device:
@@ -1484,7 +1502,7 @@ class Trainer:
         Wraps per-tensor transfer errors with actionable TrainerError.
         CUDA OOM during transfer produces a specific resolution message.
         """
-        device = torch.device(self._run_context.device)
+        device = self._expected_runtime_device()
         non_blocking = (self._run_context.device_type == "cuda")
 
         moved = {}
@@ -1601,6 +1619,10 @@ class Trainer:
 
         Returns lightweight diagnostics dict.
         """
+        # Ensure model is on device and AMP is ready (idempotent)
+        self._prepare_model()
+        self._prepare_amp()
+
         was_training = self._model_bundle.training
         try:
             self._model_bundle.eval()
@@ -2374,7 +2396,7 @@ class Trainer:
             )
 
         try:
-            device = torch.device(self._run_context.device)
+            device = self._expected_runtime_device()
             checkpoint = torch.load(str(path), map_location=device, weights_only=False)
         except Exception as exc:
             raise TrainerError(
@@ -3013,6 +3035,7 @@ def build_trainer(
 if __name__ == "__main__":
 
     import math
+    import inspect
 
     logging.basicConfig(
         level=logging.WARNING,
@@ -4023,6 +4046,48 @@ if __name__ == "__main__":
         check("old ckpt survives", ckpt45.exists())
         check("old ckpt unchanged", ckpt45.read_bytes() == old_bytes)
         check("ckpt count not advanced", t45._checkpoint_state.checkpoint_count == old_count)
+
+    # -- 46. Device canonicalization -------------------------------------------
+    print("\n  46. Device canonicalization...")
+    cfg46, ctx46, m46, o46, s46, e46 = _make_infra()
+    t46 = build_trainer(
+        config=cfg46, run_context=ctx46, model_bundle=m46,
+        optimizer=o46, scheduler=s46, evaluator=e46,
+        train_loader=_make_loader(1), render_dashboard=False,
+    )
+    dev46 = t46._expected_runtime_device()
+    check("canonical device is torch.device", isinstance(dev46, torch.device))
+    check("CPU canonical device is cpu", dev46 == torch.device("cpu"))
+
+    # -- 47. Idempotent model/AMP preparation ----------------------------------
+    print("\n  47. Idempotent preparation...")
+    cfg47, ctx47, m47, o47, s47, e47 = _make_infra()
+    t47 = build_trainer(
+        config=cfg47, run_context=ctx47, model_bundle=m47,
+        optimizer=o47, scheduler=s47, evaluator=e47,
+        train_loader=_make_loader(1), render_dashboard=False,
+    )
+    t47._prepare_model()
+    check("model_prepared flag set", t47._model_prepared is True)
+    t47._prepare_model()  # second call should be no-op
+    check("idempotent model prepare", t47._model_prepared is True)
+    t47._prepare_amp()
+    check("amp_prepared flag set", t47._amp_prepared is True)
+    t47._prepare_amp()  # second call should be no-op
+    check("idempotent amp prepare", t47._amp_prepared is True)
+
+    # -- 48. Dry-run prepares model first --------------------------------------
+    print("\n  48. Dry-run model preparation...")
+    tr_src = inspect.getsource(Trainer.dry_run_batch)
+    check("dry_run calls _prepare_model", "_prepare_model" in tr_src)
+    check("dry_run calls _prepare_amp", "_prepare_amp" in tr_src)
+
+    # -- 49. Resume ordering ---------------------------------------------------
+    print("\n  49. Resume ordering...")
+    train_src = inspect.getsource(Trainer.train)
+    prep_pos = train_src.find("_prepare_model")
+    resume_pos = train_src.find("_do_resume")
+    check("prepare_model before resume", 0 < prep_pos < resume_pos)
 
     # -- Final -----------------------------------------------------------------
     total = passed + failed

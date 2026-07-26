@@ -1478,6 +1478,44 @@ def validate_trainer_contracts(t: ValidationTracker):
         t.check("os.replace used in _save_checkpoint",
                 "os.replace" in _save_src)
 
+        # GPU runtime hardening: device canonicalization
+        t.check("Trainer._expected_runtime_device exists",
+                hasattr(Trainer, "_expected_runtime_device"))
+
+        # Idempotent preparation flags
+        _prep_src = _vinsp.getsource(Trainer._prepare_model)
+        t.check("_prepare_model is idempotent", "_model_prepared" in _prep_src)
+        _amp_src = _vinsp.getsource(Trainer._prepare_amp)
+        t.check("_prepare_amp is idempotent", "_amp_prepared" in _amp_src)
+
+        # dry_run_batch prepares model before forward
+        _dry_src = _vinsp.getsource(Trainer.dry_run_batch)
+        t.check("dry_run calls _prepare_model", "_prepare_model" in _dry_src)
+
+        # train() prepares model before resume
+        _train_src = _vinsp.getsource(Trainer.train)
+        _tprep = _train_src.find("_prepare_model")
+        _tresume = _train_src.find("_do_resume")
+        t.check("prepare_model before resume in train()", 0 < _tprep < _tresume)
+
+        # No raw torch.device(self._run_context.device) in device validation
+        _vmd_src = _vinsp.getsource(Trainer._validate_model_device)
+        t.check("_validate_model_device uses canonical device",
+                "torch.device(self._run_context.device)" not in _vmd_src)
+        _vbd_src = _vinsp.getsource(Trainer._validate_batch_device)
+        t.check("_validate_batch_device uses canonical device",
+                "torch.device(self._run_context.device)" not in _vbd_src)
+
+        # Global seeding exists in train.py
+        from training.train import _enforce_determinism
+        t.check("_enforce_determinism importable", callable(_enforce_determinism))
+
+        # worker_init_seed wiring
+        _train_py_text = open(str(Path(__file__).parent / "training" / "train.py"),
+                              encoding="utf-8").read()
+        t.check("worker_init_seed wired in _build_loaders",
+                "worker_init_seed" in _train_py_text.split("def _build_loaders")[1].split("def ")[0])
+
     except ImportError as e:
         t.fail("trainer import", str(e)[:200])
     except Exception as e:

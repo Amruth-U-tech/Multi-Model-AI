@@ -81,6 +81,8 @@ _PROJECT_DIR = _THIS_DIR.parent
 if str(_PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(_PROJECT_DIR))
 
+import copy
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import Subset
@@ -97,6 +99,41 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 MANIFEST_SCHEMA_VERSION = 1
+
+
+# =============================================================================
+# Global Reproducibility Seeding
+# =============================================================================
+
+def _enforce_determinism(seed: int, deterministic: bool) -> None:
+    """Enforce global reproducibility seeding.
+
+    Called once before any dataset, DataLoader, or model construction.
+    Sets Python, NumPy, PyTorch, and CUDA seeds. Configures CuDNN
+    deterministic policy when requested.
+    """
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        import numpy as np
+        np.random.seed(seed % (2**32))
+    except ImportError:
+        pass
+
+    if deterministic:
+        if hasattr(torch.backends, 'cudnn'):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        if hasattr(torch, 'use_deterministic_algorithms'):
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                # Older PyTorch without warn_only
+                pass
 
 _REQUIRED_MODEL_KEYS = frozenset({
     "image_encoder", "text_encoder", "tabular_encoder", "fusion_model",
@@ -591,10 +628,12 @@ def _build_loaders(
     train_cfg = DataLoaderConfig(
         batch_size=config.batch_size, shuffle=True,
         num_workers=config.num_workers, dataset_size_hint=len(train_subset),
+        worker_init_seed=config.seed,
     )
     val_cfg = DataLoaderConfig(
         batch_size=config.batch_size, shuffle=False, drop_last=False,
         num_workers=config.num_workers, dataset_size_hint=len(val_subset),
+        worker_init_seed=config.seed,
     )
     collate_cfg = CollateConfig()
 
@@ -1360,6 +1399,9 @@ def build_execution_plan(
                 expected="valid frozen config", resolution="Fix config parameters.",
             ) from exc
 
+    # -- 1b. Global seeding (before any construction)
+    _enforce_determinism(config.seed, getattr(config, 'deterministic', True))
+
     # -- 2. RunContext
     try:
         run_context = build_run_context(config)
@@ -1873,6 +1915,37 @@ def run_smoke_tests() -> int:
     check("preflight checks split overlap", "overlap" in _pf_src.lower() or "&" in _pf_src)
     check("preflight checks dim matched", "matched" in _pf_src)
     check("preflight can return failed", '"failed"' in _pf_src)
+
+    # -- 21. Global seeding exists ---------------------------------------------
+    print("\n  21. Global seeding...")
+    check("_enforce_determinism callable", callable(_enforce_determinism))
+    _ed_src = inspect.getsource(_enforce_determinism)
+    check("seeds random", "random.seed" in _ed_src)
+    check("seeds torch", "torch.manual_seed" in _ed_src)
+    check("seeds cuda", "cuda.manual_seed_all" in _ed_src)
+    check("seeds numpy", "np.random.seed" in _ed_src)
+    check("cudnn deterministic", "cudnn.deterministic" in _ed_src)
+    check("cudnn benchmark", "cudnn.benchmark" in _ed_src)
+
+    # -- 22. worker_init_seed wiring -------------------------------------------
+    print("\n  22. Worker seed wiring...")
+    _bl_src = inspect.getsource(_build_loaders)
+    check("worker_init_seed in train loader", "worker_init_seed=config.seed" in _bl_src
+          or "worker_init_seed" in _bl_src)
+
+    # -- 23. Seeding called before construction ---------------------------------
+    print("\n  23. Seeding order...")
+    _bep_src = inspect.getsource(build_execution_plan)
+    _seed_pos = _bep_src.find("_enforce_determinism")
+    _reg_pos = _bep_src.find("_discover_registry")
+    check("seeding before registry", 0 < _seed_pos < _reg_pos)
+
+    # -- 24. Dry-run uses subset not iter(loader) -------------------------------
+    print("\n  24. Dry-run strategy...")
+    _dr_src = inspect.getsource(perform_dry_run)
+    check("no iter(train_loader) in dry_run", "iter(" not in _dr_src)
+    check("uses subset[i]", "subset[i]" in _dr_src or "loader.dataset" in _dr_src)
+    check("delegates to trainer", "dry_run_batch" in _dr_src)
 
     # -- Final ----------------------------------------------------------------
     total = passed + failed
