@@ -1319,8 +1319,20 @@ def _print_final_summary(
 ) -> None:
     """Print compact final summary after training."""
     rt = result.get("runtime_state", {})
-    hist = result.get("history", [])
+    hist = result.get("history", {})
     status = rt.get("status", "unknown")
+
+    if not isinstance(hist, dict):
+        hist = {}
+
+    epochs = hist.get("epoch", [])
+    epochs_completed = len(epochs) if isinstance(epochs, (list, tuple)) else 0
+
+    def _last_history_value(key: str):
+        values = hist.get(key, [])
+        if isinstance(values, (list, tuple)) and values:
+            return values[-1]
+        return None
 
     lines = [
         "",
@@ -1329,26 +1341,31 @@ def _print_final_summary(
         "=" * 64,
         f"  Status            : {status.upper()}",
         f"  Total Runtime     : {total_seconds:.1f}s",
-        f"  Epochs Completed  : {len(hist)}",
+        f"  Epochs Completed  : {epochs_completed}",
     ]
 
-    # Best validation metric
-    if hist:
-        last = hist[-1]
-        if "val_loss" in last:
-            lines.append(f"  Final Val Loss    : {last['val_loss']:.6f}")
-        if "val_rmse" in last:
-            lines.append(f"  Final Val RMSE    : {last['val_rmse']:.6f}")
-        if "val_r2" in last:
-            lines.append(f"  Final Val R2      : {last['val_r2']:.6f}")
-        if "lr" in last:
-            lines.append(f"  Final LR          : {last['lr']:.2e}")
+    if epochs_completed > 0:
+        final_train_loss = _last_history_value("train_loss")
+        final_val_loss = _last_history_value("validation_loss")
+        final_val_rmse = _last_history_value("validation_rmse")
+        final_val_r2 = _last_history_value("validation_r2")
+        final_lr = _last_history_value("learning_rate")
+
+        if isinstance(final_train_loss, (int, float)):
+            lines.append(f"  Final Train Loss  : {final_train_loss:.6f}")
+        if isinstance(final_val_loss, (int, float)):
+            lines.append(f"  Final Val Loss    : {final_val_loss:.6f}")
+        if isinstance(final_val_rmse, (int, float)):
+            lines.append(f"  Final Val RMSE    : {final_val_rmse:.6f}")
+        if isinstance(final_val_r2, (int, float)):
+            lines.append(f"  Final Val R2      : {final_val_r2:.6f}")
+        if isinstance(final_lr, (int, float)):
+            lines.append(f"  Final LR          : {final_lr:.2e}")
 
     lines.append(f"  Checkpoint Dir    : {plan.run_context.checkpoint_dir}")
     if manifest_path:
         lines.append(f"  Manifest          : {manifest_path}")
 
-    # Next action
     if status == "completed":
         lines.append("  Next Action       : Evaluate best checkpoint on test set")
     elif status == "interrupted":
@@ -1358,7 +1375,6 @@ def _print_final_summary(
 
     lines.extend(["=" * 64, ""])
     print("\n".join(lines))
-
 
 # =============================================================================
 # Public API
